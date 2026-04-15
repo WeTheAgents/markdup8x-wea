@@ -12,6 +12,9 @@ pub struct MetricsCounters {
     pub unpaired_read_duplicates: u64,
     pub read_pair_duplicates: u64,
     pub group_sizes: Vec<u64>, // histogram: index = group_size, value = count
+    /// LIBRARY name for the metrics row. Matches Picard's `getLibraryName`
+    /// semantics: first @RG LB value, or "Unknown Library" if LB is absent.
+    pub library_name: String,
 }
 
 impl MetricsCounters {
@@ -24,6 +27,7 @@ impl MetricsCounters {
             unpaired_read_duplicates: 0,
             read_pair_duplicates: 0,
             group_sizes: Vec::new(),
+            library_name: "Unknown Library".to_string(),
         }
     }
 
@@ -155,34 +159,70 @@ pub fn write_metrics(
          ESTIMATED_LIBRARY_SIZE"
     )?;
 
-    // Data row (single library for now).
-    // ESTIMATED_LIBRARY_SIZE may be empty when undefined (zero dups, single-end-only, etc.).
+    // Data row. LIBRARY value comes from counters.library_name — Picard's
+    // `getLibraryName` semantics: first @RG LB, else "Unknown Library".
+    // ESTIMATED_LIBRARY_SIZE may be empty when undefined.
     writeln!(
         f,
-        "default\t{}\t{}\t{}\t{}\t{}\t{}\t0\t{:.6}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t0\t{}\t{}",
+        counters.library_name,
         counters.unpaired_reads_examined,
         counters.read_pairs_examined,
         counters.secondary_or_supplementary,
         counters.unmapped_reads,
         counters.unpaired_read_duplicates,
         counters.read_pair_duplicates,
-        pct,
+        trim_float(pct),
         est_str
     )?;
 
     // Blank line before histogram
     writeln!(f)?;
 
-    // Histogram
-    writeln!(f, "## HISTOGRAM\tjava.lang.Double")?;
-    writeln!(f, "BIN\tVALUE")?;
-    for (i, &count) in counters.group_sizes.iter().enumerate() {
-        if i >= 1 && count > 0 {
-            writeln!(f, "{:.1}\t{}", i as f64, count)?;
+    // Picard's `calculateRoiHistogram` emits the ROI histogram ONLY when
+    // ESTIMATED_LIBRARY_SIZE is non-null. Match that behavior.
+    if let Some(lib_size) = est_opt {
+        writeln!(f, "## HISTOGRAM\tjava.lang.Double")?;
+        writeln!(f, "BIN\tCoverageMult\tall_sets\tnon_optical_sets")?;
+        let l = lib_size as f64;
+        let n = counters.read_pairs_examined as f64;
+        let unique = (counters.read_pairs_examined - counters.read_pair_duplicates) as f64;
+        for (i, &count) in counters.group_sizes.iter().enumerate() {
+            if i >= 1 && count > 0 {
+                let x = i as f64;
+                // Picard's DuplicationMetrics.estimateRoi (research §9):
+                //   CoverageMult(x) = L * (1 - exp(-x * N / L)) / unique
+                let cov_mult = if unique > 0.0 && l > 0.0 {
+                    l * (1.0 - (-x * n / l).exp()) / unique
+                } else {
+                    1.0
+                };
+                // non_optical_sets == all_sets since we don't track optical dups.
+                writeln!(
+                    f,
+                    "{:.1}\t{}\t{}\t{}",
+                    x,
+                    trim_float(cov_mult),
+                    count,
+                    count
+                )?;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Format a float the way Picard's `FormatUtil`/`DecimalFormat("0.######")` does:
+/// up to 6 fractional digits, trailing zeros and trailing '.' stripped.
+fn trim_float(v: f64) -> String {
+    let s = format!("{:.6}", v);
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +239,7 @@ mod tests {
             unpaired_read_duplicates: 0,
             read_pair_duplicates: 11688,
             group_sizes: Vec::new(),
+            library_name: "Unknown Library".to_string(),
         };
         let pct = percent_duplication(&c);
         assert!((pct - 0.129178).abs() < 0.001);
@@ -214,6 +255,7 @@ mod tests {
             unpaired_read_duplicates: 0,
             read_pair_duplicates: 0,
             group_sizes: Vec::new(),
+            library_name: "Unknown Library".to_string(),
         };
         assert_eq!(percent_duplication(&c), 0.0);
     }
@@ -234,6 +276,7 @@ mod tests {
             unpaired_read_duplicates: 0,
             read_pair_duplicates: 99,
             group_sizes: Vec::new(),
+            library_name: "Unknown Library".to_string(),
         };
         let pct = percent_duplication(&c);
         assert!((pct - 0.99).abs() < 0.001);
@@ -284,6 +327,7 @@ mod tests {
             unpaired_read_duplicates: 10,
             read_pair_duplicates: 500,
             group_sizes: vec![0, 4000, 400, 80, 15, 5],
+            library_name: "Unknown Library".to_string(),
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -298,11 +342,11 @@ mod tests {
         assert!(content.contains("## METRICS CLASS\tpicard.sam.DuplicationMetrics"));
         // Check column headers
         assert!(content.contains("LIBRARY\tUNPAIRED_READS_EXAMINED"));
-        // Check histogram
+        // Check 4-column Picard histogram format
         assert!(content.contains("## HISTOGRAM\tjava.lang.Double"));
-        assert!(content.contains("BIN\tVALUE"));
-        // Check data row starts with library name
-        assert!(content.contains("default\t100\t5000"));
+        assert!(content.contains("BIN\tCoverageMult\tall_sets\tnon_optical_sets"));
+        // Check data row uses library_name (set to "Unknown Library" in this test)
+        assert!(content.contains("Unknown Library\t100\t5000"));
         // Optical dups = 0
         assert!(content.contains("\t0\t"));
     }

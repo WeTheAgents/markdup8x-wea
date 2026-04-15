@@ -18,7 +18,9 @@ use noodles::sam::header::record::value::map::read_group::tag::LIBRARY;
 use rustc_hash::FxHashMap;
 
 /// Build library mapping from @RG headers.
-fn build_library_map(header: &sam::Header) -> FxHashMap<Vec<u8>, u8> {
+/// Returns (rg_to_lib, lib_names) — the second is used to emit a Picard-matching
+/// LIBRARY name in the metrics file (see `metrics_library_name`).
+fn build_library_map(header: &sam::Header) -> (FxHashMap<Vec<u8>, u8>, Vec<String>) {
     let mut lib_names: Vec<String> = Vec::new();
     let mut rg_to_lib: FxHashMap<Vec<u8>, u8> = FxHashMap::default();
 
@@ -46,7 +48,20 @@ fn build_library_map(header: &sam::Header) -> FxHashMap<Vec<u8>, u8> {
         rg_to_lib.insert(id_bytes.to_vec(), lib_idx);
     }
 
-    rg_to_lib
+    (rg_to_lib, lib_names)
+}
+
+/// Choose the LIBRARY value to emit in Picard metrics. Picard's
+/// `LibraryIdGenerator.getLibraryName` returns the @RG LB tag verbatim or
+/// "Unknown Library" when LB is absent — it does NOT fall back to the @RG ID
+/// (that's only our internal grouping convention for duplicate detection).
+fn metrics_library_name(header: &sam::Header) -> String {
+    for (_id, rg) in header.read_groups().iter() {
+        if let Some(lb) = rg.other_fields().get(&LIBRARY) {
+            return String::from_utf8_lossy(lb.as_ref()).to_string();
+        }
+    }
+    "Unknown Library".to_string()
 }
 
 fn get_library_idx(record: &bam::Record, rg_to_lib: &FxHashMap<Vec<u8>, u8>) -> u8 {
@@ -96,7 +111,7 @@ pub fn scan_pass(
     reader: &mut crate::io::BamReader,
     header: &sam::Header,
 ) -> Result<ScanResult> {
-    let rg_to_lib = build_library_map(header);
+    let (rg_to_lib, _lib_names) = build_library_map(header);
 
     let mut dup_bits = BitVecDupSet::new();
     let mut pending = PendingMateBuffer::new();
@@ -104,6 +119,7 @@ pub fn scan_pass(
     let mut single_tracker = SingleEndTracker::new();
     let mut enforcer = SortOrderEnforcer::new();
     let mut counters = MetricsCounters::new();
+    counters.library_name = metrics_library_name(header);
 
     let mut record_id: u64 = 0;
     let mut prev_tid: Option<usize> = None;
