@@ -46,7 +46,7 @@ use noodles::sam::alignment::RecordBuf;
 use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
 use noodles::sam::header::record::value::map::read_group::tag::LIBRARY;
 use noodles::sam::header::record::value::map::{self, Map, ReadGroup, ReferenceSequence};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::num::NonZeroUsize;
@@ -360,4 +360,25 @@ pub fn run_markdup(input: &Path, output: &Path) -> anyhow::Result<()> {
         false,
         None,
     )
+}
+
+/// Set of QNAMEs for which at least one record in `path` has FLAG & 0x400 != 0.
+/// This matches the Picard-diff QNAME-set semantics (a pair is "marked" if either
+/// half carries the duplicate flag). Phase C3 will consume the same helper to diff
+/// our output against real Picard output.
+pub fn dup_qnames_set(path: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let file = File::open(path).expect("open output BAM");
+    let mut reader = bam::io::Reader::new(file);
+    let _header = reader.read_header().expect("read header");
+    let mut rec = bam::Record::default();
+    while reader.read_record(&mut rec).expect("read record") > 0 {
+        if u16::from(rec.flags()) & 0x400 != 0 {
+            if let Some(n) = rec.name() {
+                let b: &[u8] = n.as_ref();
+                set.insert(String::from_utf8_lossy(b).to_string());
+            }
+        }
+    }
+    set
 }
