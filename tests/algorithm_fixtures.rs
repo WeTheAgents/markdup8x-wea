@@ -699,3 +699,219 @@ fn b09_missing_lb_fallback_to_id() {
     assert_eq!(counts["pA"], 2);
     assert_eq!(counts["pB"], 2);
 }
+
+// =============================================================================
+// B10 — Intentional deviation match: MAPQ=0 on one mate does not suppress dup
+// =============================================================================
+//
+// Picard issue #1285: MQ=0 on a mate does not exclude the pair from
+// duplicate detection. We reproduce this behavior by design (documented
+// deviation). Two identical chimeric pairs, R1 at chr1:100 with MAPQ=0;
+// expected: 1 duplicate. If MQ=0 filtering sneaks in, neither pair is
+// flagged and this test catches it.
+#[test]
+fn b10_mq_zero_chimeric_pair() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    let make_r1 = |qname: &'static str| ReadSpec {
+        qname,
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mapq: 0, // <-- Picard #1285: does not suppress dedup
+        mate_ref_name: Some("chr2"),
+        mate_pos: Some(500),
+        ..Default::default()
+    };
+    let make_r2 = |qname: &'static str| ReadSpec {
+        qname,
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr2"),
+        pos: Some(500),
+        mapq: 60,
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .reference("chr2", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(make_r1("pA"))
+        .add_read(make_r1("pB"))
+        .add_read(make_r2("pA"))
+        .add_read(make_r2("pB"))
+        .write(&input)
+        .unwrap();
+
+    run_markdup(&input, &output).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert_eq!(
+        dups.len(),
+        1,
+        "MAPQ=0 must not suppress dedup (Picard issue #1285 match), got {:?}",
+        dups
+    );
+}
+
+// =============================================================================
+// B11 — A4: cross-RG same-QNAME mate lookup isolation
+// =============================================================================
+//
+// Two reads in different RGs with the IDENTICAL QNAME "shared", at DIFFERENT
+// positions. The A4 fix (src/pending_mates.rs:23-36) keys pending-mate
+// lookup by (library_idx, qname_hash), so the two same-named pairs do not
+// collide in the pending buffer and both pairs resolve correctly.
+//
+// Assertion: no duplicates (positions differ) AND all 4 records are in
+// output (pair_count_by_qname["shared"] == 4). If A4 is broken, one pair's
+// R1 would be matched against the other pair's R2 and produce garbage or
+// lose records.
+#[test]
+fn b11_cross_rg_same_qname_not_matched() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+    let metrics = dir.path().join("out.metrics.txt");
+
+    // rg1 pair at chr1:100 / chr1:500
+    let a_r1 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(500),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let a_r2 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    // rg2 pair at chr1:200 / chr1:700 (different positions)
+    let b_r1 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(200),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(700),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+    let b_r2 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(700),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(200),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .read_group("rg2", "lib2")
+        .add_read(a_r1)
+        .add_read(b_r1)
+        .add_read(a_r2)
+        .add_read(b_r2)
+        .write(&input)
+        .unwrap();
+
+    run_markdup_with_metrics(&input, &output, &metrics).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert!(
+        dups.is_empty(),
+        "distinct libraries + distinct positions → no dups, got {:?}",
+        dups
+    );
+    let counts = pair_count_by_qname(&output);
+    assert_eq!(
+        counts.get("shared").copied().unwrap_or(0),
+        4,
+        "all 4 records must be preserved (no collision via QNAME hash)"
+    );
+    let recs = parse_metrics(&metrics).unwrap();
+    assert_eq!(recs[0].read_pair_duplicates, 0);
+    assert_eq!(recs[0].read_pairs_examined, 2);
+}
+
+// =============================================================================
+// B12 — A6: bisection does not panic on near-degenerate input
+// =============================================================================
+//
+// Four identical pairs → 3 duplicates, 1 unique ("winner"). This is the
+// smallest-unique-ratio input realizable with standard grouping and exercises
+// the Lander-Waterman bisection's growing upper bracket (src/metrics.rs:53-117).
+// The bisection must not panic and must produce a finite `Some(_)` estimate.
+// True `None` (undefined) is tested by B13 where pair_duplicates == 0.
+#[test]
+fn b12_all_duplicates_metric_not_panicking() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+    let metrics = dir.path().join("out.metrics.txt");
+
+    let make_r1 = |qname: &'static str| ReadSpec {
+        qname,
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(500),
+        ..Default::default()
+    };
+    let make_r2 = |qname: &'static str| ReadSpec {
+        qname,
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(make_r1("p1"))
+        .add_read(make_r1("p2"))
+        .add_read(make_r1("p3"))
+        .add_read(make_r1("p4"))
+        .add_read(make_r2("p1"))
+        .add_read(make_r2("p2"))
+        .add_read(make_r2("p3"))
+        .add_read(make_r2("p4"))
+        .write(&input)
+        .unwrap();
+
+    // Must not panic on bisection edge (unique=0).
+    run_markdup_with_metrics(&input, &output, &metrics).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert_eq!(dups.len(), 3, "4 identical pairs → 3 duplicates, got {:?}", dups);
+
+    let recs = parse_metrics(&metrics).unwrap();
+    assert_eq!(recs[0].read_pair_duplicates, 3);
+    assert_eq!(recs[0].read_pairs_examined, 4);
+    assert!(
+        recs[0].estimated_library_size.is_some(),
+        "bisection must yield a finite estimate, not panic, got {:?}",
+        recs[0].estimated_library_size
+    );
+}
