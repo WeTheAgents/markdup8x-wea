@@ -1,0 +1,27 @@
+[package]
+name = "markdup-wea"
+version = "0.1.0"
+edition = "2021"
+authors = ["WeTheAgents"]
+description = "Fast BAM duplicate marker — Picard-compatible, Rust-powered"
+license = "MIT"
+repository = "https://github.com/peachgabba22/markdup-wea"
+
+[dependencies]
+noodles = { version = "0.96", features = ["bam", "sam", "bgzf", "core"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+rustc-hash = "2"
+bitvec = "1"
+tempfile = "3"
+
+[dev-dependencies]
+noodles = { version = "0.96", features = ["bam", "sam", "bgzf", "core"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
