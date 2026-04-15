@@ -915,3 +915,52 @@ fn b12_all_duplicates_metric_not_panicking() {
         recs[0].estimated_library_size
     );
 }
+
+// =============================================================================
+// B13 — A5 + A7: single-end-only input produces valid metrics with empty estimate
+// =============================================================================
+//
+// Three single-end reads at distinct positions (no duplicates among them).
+// Zero paired reads → zero READ_PAIRS_EXAMINED → zero READ_PAIR_DUPLICATES.
+// A7 must serialize ESTIMATED_LIBRARY_SIZE as an empty field (None in our
+// parser), and UNPAIRED_READS_EXAMINED (A5) must reflect all three fragments.
+#[test]
+fn b13_zero_pairs_metric_produces_valid_file() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+    let metrics = dir.path().join("out.metrics.txt");
+
+    let mk = |qname: &'static str, pos: usize| ReadSpec {
+        qname,
+        flags: 0,
+        ref_name: Some("chr1"),
+        pos: Some(pos),
+        cigar: "100M",
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(mk("s1", 100))
+        .add_read(mk("s2", 200))
+        .add_read(mk("s3", 300))
+        .write(&input)
+        .unwrap();
+
+    run_markdup_with_metrics(&input, &output, &metrics).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert!(dups.is_empty(), "distinct positions → no dups, got {:?}", dups);
+
+    let recs = parse_metrics(&metrics).unwrap();
+    assert_eq!(recs[0].unpaired_reads_examined, 3, "A5: orphan counter = 3 SE reads");
+    assert_eq!(recs[0].read_pairs_examined, 0);
+    assert_eq!(recs[0].read_pair_duplicates, 0);
+    assert_eq!(recs[0].percent_duplication, 0.0);
+    assert_eq!(
+        recs[0].estimated_library_size, None,
+        "A7: undefined estimate serializes as empty field"
+    );
+}
