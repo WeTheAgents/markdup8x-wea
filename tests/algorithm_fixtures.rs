@@ -239,3 +239,239 @@ fn b03_orphan_paired_read_treated_as_fragment() {
         dups
     );
 }
+
+// =============================================================================
+// B4 — Regression: chimeric pair flagging (cross-chromosome)
+// =============================================================================
+//
+// Two identical chimeric pairs (R1 on chr1, R2 on chr2) must still group by
+// PairedEndKey and produce one duplicate. Exercises that A1 same-locus
+// normalization doesn't accidentally interfere with cross-chromosome pairs.
+//
+// Implementation note: R2 must be REVERSE so its unclipped_5' extends beyond
+// alignment_start, otherwise pair_A would be resolved immediately upon its R2
+// arrival (before pair_B's R2) and the two would never group. This is the
+// same timing invariant normal non-chimeric paired dedup relies on.
+#[test]
+fn b04_chimeric_pair_both_flagged() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    // Manual 4-read construction so coordinate order is correct across chromosomes.
+    let pa_r1 = ReadSpec {
+        qname: "pA",
+        flags: 0x1 | 0x40 | 0x20, // paired, first, mate-reverse
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr2"),
+        mate_pos: Some(500),
+        ..Default::default()
+    };
+    let pb_r1 = ReadSpec {
+        qname: "pB",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr2"),
+        mate_pos: Some(500),
+        ..Default::default()
+    };
+    let pa_r2 = ReadSpec {
+        qname: "pA",
+        flags: 0x1 | 0x80 | 0x10, // paired, second, reverse
+        ref_name: Some("chr2"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+    let pb_r2 = ReadSpec {
+        qname: "pB",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr2"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .reference("chr2", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(pa_r1)
+        .add_read(pb_r1)
+        .add_read(pa_r2)
+        .add_read(pb_r2)
+        .write(&input)
+        .unwrap();
+
+    run_markdup(&input, &output).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert_eq!(
+        dups.len(),
+        1,
+        "expected exactly 1 duplicate chimeric pair, got {:?}",
+        dups
+    );
+    assert!(dups.contains("pA") || dups.contains("pB"));
+}
+
+// =============================================================================
+// B5 — Regression: splice CIGAR with N, reverse-strand → different 5' → not dup
+// =============================================================================
+//
+// Two paired reads with R1 reverse on chr1:100 but different N-sizes. For
+// reverse reads, unclipped_5' = alignment_start + ref_consumed - 1, which
+// DOES include the N-skip in ref_consumed. Different intron sizes → different
+// unclipped_5' → different PairedEndKey → NOT duplicates.
+//
+// Calculations:
+//   "a" R1 rev pos=100 CIGAR=50M100N50M: ref_consumed=200, 5'=100+200-1=299
+//   "b" R1 rev pos=100 CIGAR=50M200N50M: ref_consumed=300, 5'=100+300-1=399
+//   R2 fwd pos=1000: 5'=1000 for both
+// "a" key: (chr1, 299, rev) ↔ (chr1, 1000, fwd)
+// "b" key: (chr1, 399, rev) ↔ (chr1, 1000, fwd) — different lo → different group.
+#[test]
+fn b05_spliced_reverse_different_introns_not_dup() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    let a_r1 = ReadSpec {
+        qname: "a",
+        flags: 0x1 | 0x40 | 0x10, // paired, first, reverse (mate is fwd)
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        cigar: "50M100N50M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(1000),
+        ..Default::default()
+    };
+    let b_r1 = ReadSpec {
+        qname: "b",
+        flags: 0x1 | 0x40 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        cigar: "50M200N50M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(1000),
+        ..Default::default()
+    };
+    let a_r2 = ReadSpec {
+        qname: "a",
+        flags: 0x1 | 0x80 | 0x20, // paired, second, mate-reverse (R1 rev)
+        ref_name: Some("chr1"),
+        pos: Some(1000),
+        cigar: "100M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+    let b_r2 = ReadSpec {
+        qname: "b",
+        flags: 0x1 | 0x80 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(1000),
+        cigar: "100M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(a_r1)
+        .add_read(b_r1)
+        .add_read(a_r2)
+        .add_read(b_r2)
+        .write(&input)
+        .unwrap();
+
+    run_markdup(&input, &output).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert!(
+        dups.is_empty(),
+        "different intron sizes on reverse R1 must not group (unclipped_5' differs), got {:?}",
+        dups
+    );
+}
+
+// =============================================================================
+// B6 — Regression: splice CIGAR with N, forward-strand → same 5' → are dup
+// =============================================================================
+//
+// Two paired reads with R1 forward on chr1:100 with different N-sizes. For
+// forward reads, unclipped_5' = alignment_start (plus soft-clip, none here).
+// N-size doesn't affect forward unclipped_5' → same PairedEndKey → ARE dups.
+#[test]
+fn b06_spliced_forward_same_start_are_dup() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    let a_r1 = ReadSpec {
+        qname: "a",
+        flags: 0x1 | 0x40 | 0x20, // paired, first, fwd, mate-reverse
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        cigar: "50M100N50M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(2000),
+        ..Default::default()
+    };
+    let b_r1 = ReadSpec {
+        qname: "b",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        cigar: "50M200N50M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(2000),
+        ..Default::default()
+    };
+    let a_r2 = ReadSpec {
+        qname: "a",
+        flags: 0x1 | 0x80 | 0x10, // paired, second, reverse
+        ref_name: Some("chr1"),
+        pos: Some(2000),
+        cigar: "100M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+    let b_r2 = ReadSpec {
+        qname: "b",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(2000),
+        cigar: "100M",
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(a_r1)
+        .add_read(b_r1)
+        .add_read(a_r2)
+        .add_read(b_r2)
+        .write(&input)
+        .unwrap();
+
+    run_markdup(&input, &output).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert_eq!(
+        dups.len(),
+        1,
+        "forward-strand same alignment_start + differing N → same unclipped_5' → 1 dup, got {:?}",
+        dups
+    );
+}
