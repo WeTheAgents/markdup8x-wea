@@ -1,0 +1,33 @@
+schema: spec-driven
+
+context: |
+  Project: markdup-wea — Rust-based BAM duplicate marker
+  Language: Rust (2021 edition, stable toolchain)
+  Domain: Bioinformatics / NGS data processing
+  Target integration: nf-core/rnaseq pipeline (1200+ stars, Seqera Labs)
+  Reference tools: Picard MarkDuplicates (Java), samtools markdup (C/htslib)
+  I/O library: rust-htslib 0.47 (static C bindings to htslib)
+  Input format: Coordinate-sorted BAM (SAM specification v1.6)
+  Output formats: BAM (with duplicate flags), Picard-format metrics (TSV)
+  Testing: cargo test (unit), real BAM fixtures (integration), MultiQC (metrics)
+  CI: GitHub Actions (Linux, macOS, Windows cross-compile)
+  License: MIT
+
+rules:
+  proposal:
+    - Reference SAM specification for flag/field definitions
+    - Include performance targets with specific numbers from benchmarks
+    - Note deviations from Picard behavior explicitly
+  specs:
+    - Every BAM flag manipulation must cite the SAM spec bit
+    - Every scoring/grouping rule must have a concrete scenario with read data
+    - Error handling scenarios for corrupt/malformed input are mandatory
+    - Specify exact output format for MultiQC compatibility
+  design:
+    - Include memory budget analysis with per-component breakdown
+    - Document hash collision probability for QNAME hashing
+    - Reference existing benchmark data from domains/rnaseq/benchmark_results/
+  tasks:
+    - Gate yeast validation before human genome testing
+    - Include test fixture creation as explicit tasks
+    - Every phase ends with a "done when" checkpoint
