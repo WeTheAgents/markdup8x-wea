@@ -126,6 +126,14 @@ impl BamBuilder {
         self
     }
 
+    /// Add a read group (@RG) **without an LB tag** — used to test the A3
+    /// fallback where the library name defaults to the @RG ID. Encoded here
+    /// as a sentinel empty string which build_header skips when emitting LB.
+    pub fn read_group_no_lb(mut self, id: &str) -> Self {
+        self.read_groups.push((id.to_string(), String::new()));
+        self
+    }
+
     /// Override the @HD SO field (default: "coordinate"). Used for negative tests.
     pub fn sort_order(mut self, so: &str) -> Self {
         self.override_sort_order = Some(so.to_string());
@@ -200,7 +208,10 @@ impl BamBuilder {
 
         for (id, lib) in &self.read_groups {
             let mut rg = Map::<ReadGroup>::default();
-            rg.other_fields_mut().insert(LIBRARY, BString::from(lib.as_str()));
+            // Empty library string = sentinel from `read_group_no_lb`: omit the LB tag.
+            if !lib.is_empty() {
+                rg.other_fields_mut().insert(LIBRARY, BString::from(lib.as_str()));
+            }
             builder = builder.add_read_group(id.clone(), rg);
         }
 
@@ -360,6 +371,124 @@ pub fn run_markdup(input: &Path, output: &Path) -> anyhow::Result<()> {
         false,
         None,
     )
+}
+
+/// Like `run_markdup` but also writes a Picard-format metrics file.
+pub fn run_markdup_with_metrics(
+    input: &Path,
+    output: &Path,
+    metrics: &Path,
+) -> anyhow::Result<()> {
+    markdup_wea::markdup::run(
+        input.to_str().unwrap(),
+        Some(output.to_str().unwrap()),
+        Some(metrics.to_str().unwrap()),
+        1,
+        false,
+        None,
+    )
+}
+
+/// Picard-format DuplicationMetrics row. `estimated_library_size` is `None`
+/// when the underlying field is empty (undefined estimate — A7 serialization).
+#[derive(Debug, Default, Clone)]
+pub struct MetricsRecord {
+    pub library: String,
+    pub unpaired_reads_examined: u64,
+    pub read_pairs_examined: u64,
+    pub secondary_or_supplementary_rds: u64,
+    pub unmapped_reads: u64,
+    pub unpaired_read_duplicates: u64,
+    pub read_pair_duplicates: u64,
+    pub read_pair_optical_duplicates: u64,
+    pub percent_duplication: f64,
+    pub estimated_library_size: Option<u64>,
+}
+
+/// Parse a Picard-format metrics file. Binds columns by header name (robust to
+/// column-order changes across Picard versions). Returns one `MetricsRecord`
+/// per data row — our writer currently emits a single "default" row, but Phase
+/// C will read real Picard output which may have multiple libraries.
+pub fn parse_metrics(path: &Path) -> anyhow::Result<Vec<MetricsRecord>> {
+    use std::io::Read;
+    let mut s = String::new();
+    File::open(path)?.read_to_string(&mut s)?;
+
+    let mut lines = s.lines();
+    // Scan for "## METRICS CLASS" marker.
+    loop {
+        match lines.next() {
+            Some(l) if l.starts_with("## METRICS CLASS") => break,
+            Some(_) => continue,
+            None => anyhow::bail!("no METRICS CLASS section found in {:?}", path),
+        }
+    }
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing column header line after METRICS CLASS"))?;
+    let cols: Vec<&str> = header_line.split('\t').collect();
+    let idx = |name: &str| -> anyhow::Result<usize> {
+        cols.iter()
+            .position(|c| *c == name)
+            .ok_or_else(|| anyhow::anyhow!("column {} missing in metrics header", name))
+    };
+    let i_lib = idx("LIBRARY")?;
+    let i_uex = idx("UNPAIRED_READS_EXAMINED")?;
+    let i_rpx = idx("READ_PAIRS_EXAMINED")?;
+    let i_sos = idx("SECONDARY_OR_SUPPLEMENTARY_RDS")?;
+    let i_unm = idx("UNMAPPED_READS")?;
+    let i_urd = idx("UNPAIRED_READ_DUPLICATES")?;
+    let i_rpd = idx("READ_PAIR_DUPLICATES")?;
+    let i_rpo = idx("READ_PAIR_OPTICAL_DUPLICATES")?;
+    let i_pct = idx("PERCENT_DUPLICATION")?;
+    let i_els = idx("ESTIMATED_LIBRARY_SIZE")?;
+
+    let mut out = Vec::new();
+    for line in lines {
+        if line.is_empty() || line.starts_with("## ") {
+            break;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        let els = f.get(i_els).copied().unwrap_or("");
+        out.push(MetricsRecord {
+            library: f.get(i_lib).copied().unwrap_or("").to_string(),
+            unpaired_reads_examined: f.get(i_uex).and_then(|v| v.parse().ok()).unwrap_or(0),
+            read_pairs_examined: f.get(i_rpx).and_then(|v| v.parse().ok()).unwrap_or(0),
+            secondary_or_supplementary_rds: f
+                .get(i_sos)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            unmapped_reads: f.get(i_unm).and_then(|v| v.parse().ok()).unwrap_or(0),
+            unpaired_read_duplicates: f.get(i_urd).and_then(|v| v.parse().ok()).unwrap_or(0),
+            read_pair_duplicates: f.get(i_rpd).and_then(|v| v.parse().ok()).unwrap_or(0),
+            read_pair_optical_duplicates: f.get(i_rpo).and_then(|v| v.parse().ok()).unwrap_or(0),
+            percent_duplication: f.get(i_pct).and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            estimated_library_size: if els.is_empty() {
+                None
+            } else {
+                els.parse().ok()
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Count of records per QNAME in `path`. Used to assert that no pair was lost
+/// to a cross-RG QNAME collision (see B11).
+pub fn pair_count_by_qname(path: &Path) -> HashMap<String, usize> {
+    let mut map: HashMap<String, usize> = HashMap::new();
+    let file = File::open(path).expect("open output BAM");
+    let mut reader = bam::io::Reader::new(file);
+    let _header = reader.read_header().expect("read header");
+    let mut rec = bam::Record::default();
+    while reader.read_record(&mut rec).expect("read record") > 0 {
+        if let Some(n) = rec.name() {
+            let b: &[u8] = n.as_ref();
+            *map.entry(String::from_utf8_lossy(b).to_string())
+                .or_insert(0) += 1;
+        }
+    }
+    map
 }
 
 /// Set of QNAMEs for which at least one record in `path` has FLAG & 0x400 != 0.

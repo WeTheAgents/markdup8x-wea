@@ -12,7 +12,10 @@
 
 mod common;
 
-use common::{dup_qnames_set, run_markdup, BamBuilder, ReadSpec};
+use common::{
+    dup_qnames_set, pair_count_by_qname, parse_metrics, run_markdup, run_markdup_with_metrics,
+    BamBuilder, ReadSpec,
+};
 use tempfile::tempdir;
 
 // =============================================================================
@@ -474,4 +477,225 @@ fn b06_spliced_forward_same_start_are_dup() {
         "forward-strand same alignment_start + differing N → same unclipped_5' → 1 dup, got {:?}",
         dups
     );
+}
+
+// =============================================================================
+// B7 — Scoring: explicit Q0 bases must score 0 (not auto-filled to Q30)
+// =============================================================================
+//
+// Two identical single-end reads at chr1:100. "high" has Q30 qualities, "low"
+// has explicit Q0 qualities. Q30 must win; "low" is the duplicate. The trick
+// is that common::ReadSpec auto-fills an empty `qual` vec with Q30 (see
+// tests/common/mod.rs:252) — we must pass `vec![0u8;100]` explicitly to make
+// the low-quality read actually score zero.
+#[test]
+fn b07_missing_qual_scores_as_zero() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    let high = ReadSpec {
+        qname: "high",
+        flags: 0,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mapq: 60,
+        cigar: "100M",
+        qual: vec![30u8; 100],
+        ..Default::default()
+    };
+    let low = ReadSpec {
+        qname: "low",
+        flags: 0,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mapq: 60,
+        cigar: "100M",
+        qual: vec![0u8; 100],
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(high)
+        .add_read(low)
+        .write(&input)
+        .unwrap();
+
+    run_markdup(&input, &output).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert_eq!(dups.len(), 1);
+    assert!(
+        dups.contains("low"),
+        "Q0 read must lose to Q30 read, got {:?}",
+        dups
+    );
+}
+
+// =============================================================================
+// B8 — A3: two RGs with same LB group as one library
+// =============================================================================
+//
+// Two @RG entries both tagged LB:libA. Two identical pairs, one per RG. The
+// library-idx resolution (src/scan.rs:26-36) must map both RGs to the same
+// library, so the pairs land in the same PairedEndKey group and one is
+// flagged as a duplicate.
+#[test]
+fn b08_multiple_rg_same_lb_same_library() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+    let metrics = dir.path().join("out.metrics.txt");
+
+    let pa_r1 = ReadSpec {
+        qname: "pA",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(500),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let pb_r1 = ReadSpec {
+        qname: "pB",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(500),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+    let pa_r2 = ReadSpec {
+        qname: "pA",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let pb_r2 = ReadSpec {
+        qname: "pB",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "libA")
+        .read_group("rg2", "libA")
+        .add_read(pa_r1)
+        .add_read(pb_r1)
+        .add_read(pa_r2)
+        .add_read(pb_r2)
+        .write(&input)
+        .unwrap();
+
+    run_markdup_with_metrics(&input, &output, &metrics).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert_eq!(
+        dups.len(),
+        1,
+        "same LB across RGs must group as one library, got {:?}",
+        dups
+    );
+
+    let recs = parse_metrics(&metrics).unwrap();
+    assert_eq!(recs.len(), 1, "writer emits a single aggregated row");
+    assert_eq!(recs[0].read_pair_duplicates, 1);
+    assert_eq!(recs[0].read_pairs_examined, 2);
+}
+
+// =============================================================================
+// B9 — A3 fallback: two RGs with NO LB tag → library falls back to RG ID
+// =============================================================================
+//
+// Two @RG entries without LB. Scanner's A3 fallback (src/scan.rs:26-36)
+// assigns a library per RG ID, so the two RGs form DIFFERENT library
+// buckets. Two identical pairs, one per RG, must NOT group → zero duplicates.
+#[test]
+fn b09_missing_lb_fallback_to_id() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+    let metrics = dir.path().join("out.metrics.txt");
+
+    let pa_r1 = ReadSpec {
+        qname: "pA",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(500),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let pb_r1 = ReadSpec {
+        qname: "pB",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(500),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+    let pa_r2 = ReadSpec {
+        qname: "pA",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let pb_r2 = ReadSpec {
+        qname: "pB",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(500),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group_no_lb("rg1")
+        .read_group_no_lb("rg2")
+        .add_read(pa_r1)
+        .add_read(pb_r1)
+        .add_read(pa_r2)
+        .add_read(pb_r2)
+        .write(&input)
+        .unwrap();
+
+    run_markdup_with_metrics(&input, &output, &metrics).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert!(
+        dups.is_empty(),
+        "RGs without LB must fall back to distinct library ids → no grouping, got {:?}",
+        dups
+    );
+
+    let recs = parse_metrics(&metrics).unwrap();
+    assert_eq!(recs[0].read_pair_duplicates, 0);
+    // Sanity: no pair lost.
+    let counts = pair_count_by_qname(&output);
+    assert_eq!(counts["pA"], 2);
+    assert_eq!(counts["pB"], 2);
 }
