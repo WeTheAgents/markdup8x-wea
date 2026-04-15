@@ -152,10 +152,16 @@ Mitigation: static feature bundles htslib. CI builds release binaries for Linux/
 Impact: medium — breaks pipeline integration.
 Mitigation: test exact format against MultiQC 1.19+. The critical line is `## METRICS CLASS\tpicard.sam.markduplicates.DuplicationMetrics` — must be character-identical.
 
+### Decision 7: Pre-existing duplicate flag clearing
+Clearing FLAG 0x400 on all input reads before grouping because:
+- Picard re-marks from scratch (clears and re-evaluates)
+- Without clearing, a pre-flagged read could be scored lower than it should be (if scoring depends on flags)
+- Implementation: in Pass 2, always clear 0x400 first, then set if record_id is in dup_bits
+- Cost: one bitwise AND per record — negligible
+
+### Decision 8: Tie-breaking by record_id
+When two pairs have identical combined_score, the pair with the lower record_id_1 (first encountered in BAM) wins. This matches Picard's index-based tie-breaking. Verified by design; to be confirmed on test data.
+
 ## Open Questions
 
-1. **Tie-breaking:** When two pairs have identical combined_score, which wins? Picard uses "first encountered" (index-based). We should match this — use the pair with the lower record_id_1. Verify on test data.
-
-2. **ESTIMATED_LIBRARY_SIZE without optical adjustment:** Picard subtracts optical dups before computing library size. We report 0 optical dups → our library size estimate will be slightly lower than Picard's when optical dups exist. Document this as known deviation. For standard Illumina flowcells (our test data), optical = 0, so estimates should match.
-
-3. **Pre-existing duplicate flags:** Should we clear FLAG 0x400 on input reads before grouping? Picard does (it re-marks from scratch). We should too — adds one bitwise AND per record in Pass 2.
+1. **ESTIMATED_LIBRARY_SIZE without optical adjustment:** Picard subtracts optical dups before computing library size. We report 0 optical dups → our library size estimate will be slightly lower than Picard's when optical dups exist. Document this as known deviation. For standard Illumina flowcells (our test data), optical = 0, so estimates should match.

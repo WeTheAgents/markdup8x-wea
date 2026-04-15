@@ -112,7 +112,7 @@
 - [ ] 8.6 Compare metrics values to Picard's metrics on same samples
 - [ ] 8.7 Benchmark both DupSet strategies on all 5 samples: wall time (hyperfine), peak RSS (/usr/bin/time -v)
 - [ ] 8.8 Pick DupSet winner. If negligible difference → keep BitVec.
-- [ ] 8.9 Test stdin piping: `samtools view -h yeast.bam | markdup-wea - -o out.bam`
+- [ ] 8.9 Test stdin piping: `cat yeast.bam | markdup-wea - -o out.bam`
 - [ ] 8.10 Test --remove-duplicates produces correct count
 - [ ] 8.11 Verify static binary size < 10MB
 

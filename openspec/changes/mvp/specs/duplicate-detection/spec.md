@@ -23,18 +23,18 @@ The system SHALL read a coordinate-sorted BAM file in two passes: a scan pass to
 ### Requirement: Record classification
 The system SHALL classify each BAM record into exactly one category for processing.
 
-#### Scenario: Classification routing
-- **WHEN** a record has FLAG & 0x4 (unmapped)
+#### Scenario: Classification routing (evaluated in priority order — first match wins)
+- **WHEN** a record has FLAG & 0x4 (unmapped) — checked FIRST
 - **THEN** it is classified as "unmapped" and skipped for grouping
-- **WHEN** a record has FLAG & 0x100 (secondary)
+- **WHEN** a record has FLAG & 0x100 (secondary) — checked SECOND
 - **THEN** it is classified as "secondary" and skipped for grouping
-- **WHEN** a record has FLAG & 0x800 (supplementary)
+- **WHEN** a record has FLAG & 0x800 (supplementary) — checked THIRD
 - **THEN** it is classified as "supplementary" and skipped for grouping
-- **WHEN** a record has FLAG & 0x1 (paired) and FLAG & 0x8 (mate unmapped)
+- **WHEN** a record has FLAG & 0x1 (paired) and FLAG & 0x8 (mate unmapped) — checked FOURTH
 - **THEN** it is classified as "paired-mate-unmapped" and routed to single-end grouping
-- **WHEN** a record has FLAG & 0x1 (paired) and !(FLAG & 0x4) and !(FLAG & 0x8)
+- **WHEN** a record has FLAG & 0x1 (paired) and !(FLAG & 0x4) and !(FLAG & 0x8) — checked FIFTH
 - **THEN** it is classified as "paired-both-mapped" and routed to paired-end grouping
-- **WHEN** a record has !(FLAG & 0x1) (unpaired) and !(FLAG & 0x4)
+- **WHEN** a record has !(FLAG & 0x1) (unpaired) and !(FLAG & 0x4) — checked SIXTH (fallthrough)
 - **THEN** it is classified as "single-end" and routed to single-end grouping
 
 ### Requirement: Duplicate flag semantics

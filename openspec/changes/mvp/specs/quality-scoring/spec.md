@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Base quality sum scoring
-The system SHALL score each read by summing base qualities that are >= 15 (Phred scale), matching Picard's TOTAL_MAPPED_REFERENCE_LENGTH scoring strategy.
+The system SHALL score each read by summing base qualities that are >= 15 (Phred scale), matching Picard's SUM_OF_BASE_QUALITIES scoring strategy (the default).
 
 #### Scenario: All high-quality bases
 - **GIVEN** a read with base qualities [30, 25, 20, 35, 40]
@@ -46,7 +46,7 @@ The system SHALL select the highest-scoring read (or pair) in each duplicate gro
 - **GIVEN** a group with pair A (score 800) and pair B (score 800)
 - **WHEN** the group is resolved
 - **THEN** exactly one pair is primary and the other is flagged
-- **AND** the choice is deterministic (e.g., first encountered or lowest QNAME hash)
+- **AND** the pair with the lower record_id (first encountered in BAM) wins, matching Picard's index-based tie-breaking
 
 #### Scenario: Group of one (no duplicates)
 - **GIVEN** a group containing exactly one pair

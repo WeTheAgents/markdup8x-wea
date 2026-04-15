@@ -74,7 +74,8 @@ The system SHALL track unpaired mates using a FxHashMap keyed by 64-bit hash of 
 - **AND** FxHash("READ_A") == FxHash("READ_B") (collision)
 - **WHEN** read B looks up its mate in pending_mates
 - **THEN** the system detects the collision via check_hash mismatch (first 4 bytes of QNAME)
-- **AND** read B is treated as a new pending mate, not paired with read A
+- **AND** read B is stored as an additional pending mate (separate hash bucket or Vec)
+- **AND** when read B's real mate arrives, it resolves against the correct pending entry
 
 #### Scenario: Orphan reads (mate never found)
 - **GIVEN** a paired read whose mate is not present in the BAM

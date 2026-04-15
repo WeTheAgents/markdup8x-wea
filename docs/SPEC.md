@@ -15,7 +15,7 @@ Picard MarkDuplicates is the 3rd most expensive step in nf-core/rnaseq (~9% runt
 | Metric | Picard | samtools t=1 | samtools t=4 | **markdup-wea** |
 |--------|--------|-------------|-------------|-----------------|
 | Wall time (human) | 1,791s | 5,070s | 1,220s | **<1,500s (t=1), <900s (t=4)** |
-| Peak RSS | 21.5GB | 3.1GB | 3.6GB | **<200MB** |
+| Peak RSS | 21.5GB | 3.1GB | 3.6GB | **<200MB (BitVec) / <400MB (FxHashSet)** |
 | Passes | 1 (but buffers internally) | 4 | 4 | **2** |
 
 Correctness: identical dup counts to Picard on 5 yeast + 8 human samples.
@@ -38,7 +38,7 @@ Single-pass alternatives (buffering all records per chromosome, or writing then 
 
 ### Pass 1 -- Scan
 
-Read every record sequentially. Assign each record a sequential `record_id: u64` (counter from 0). Classify each record:
+Read every record sequentially. Assign each record a sequential `record_id: u64` (counter from 0). Classify each record (checked in priority order — first match wins):
 
 | Record type | How to detect | Action |
 |-------------|--------------|--------|
@@ -178,7 +178,7 @@ struct PendingMate {
 // Stored in FxHashMap<u64, PendingMate> keyed by name_hash
 ```
 
-When mate arrives, collision check: compare `check_hash`. If mismatch (hash collision), fall back to full QNAME comparison by re-reading the record (extremely rare with 64-bit primary hash).
+When mate arrives, collision check: compare `check_hash`. If mismatch (hash collision), store as additional pending mate (extremely rare with 64-bit primary hash). Real mate resolves later against the correct entry.
 
 `src/groups.rs`:
 ```rust
@@ -206,7 +206,7 @@ struct GroupTracker {
 }
 ```
 
-Group resolution: for each group, sort by combined_score desc. Index 0 = primary (not flagged). All others -> set `dup_bits[record_id_1]` and `dup_bits[record_id_2]`.
+Group resolution: for each group, sort by combined_score desc, then by record_id_1 asc (tie-breaking: first encountered wins, matching Picard). Index 0 = primary (not flagged). All others -> set `dup_bits[record_id_1]` and `dup_bits[record_id_2]`.
 
 `src/scan.rs` -- Pass 1 orchestrator:
 - Read all records, classify, route to single-end or paired-end grouping
