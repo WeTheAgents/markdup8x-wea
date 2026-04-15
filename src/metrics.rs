@@ -140,11 +140,10 @@ pub fn write_metrics(
         version, input_path, output_path
     )?;
 
-    // Metrics class line (TAB-separated — critical for MultiQC)
-    writeln!(
-        f,
-        "## METRICS CLASS\tpicard.sam.markduplicates.DuplicationMetrics"
-    )?;
+    // Metrics class line (TAB-separated — critical for MultiQC).
+    // Picard v3.x (verified on real nf-core/rnaseq output) writes
+    // `picard.sam.DuplicationMetrics`, NOT the `markduplicates.` sub-package.
+    writeln!(f, "## METRICS CLASS\tpicard.sam.DuplicationMetrics")?;
 
     // Column headers
     writeln!(
@@ -296,7 +295,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
 
         // Check critical MultiQC header
-        assert!(content.contains("## METRICS CLASS\tpicard.sam.markduplicates.DuplicationMetrics"));
+        assert!(content.contains("## METRICS CLASS\tpicard.sam.DuplicationMetrics"));
         // Check column headers
         assert!(content.contains("LIBRARY\tUNPAIRED_READS_EXAMINED"));
         // Check histogram
