@@ -50,53 +50,70 @@ pub fn percent_duplication(counters: &MetricsCounters) -> f64 {
     }
 }
 
-/// Estimate library size using Lander-Waterman equation.
-/// Solve c/x = 1 - exp(-n/x) for x via Newton's method.
-/// n = read_pairs_examined, c = unique pairs = n - duplicates.
-pub fn estimate_library_size(pairs_examined: u64, pair_duplicates: u64) -> u64 {
-    if pairs_examined == 0 {
-        return 0;
-    }
-    let n = pairs_examined as f64;
-    let c = (pairs_examined - pair_duplicates) as f64;
-
-    if c == 0.0 {
-        return 0;
-    }
-    if c == n {
-        return n as u64; // No duplicates
+/// Estimate library size using Picard's Lander-Waterman bisection (research §9).
+///
+/// Solves `f(x) = c/x - 1 + exp(-n/x) = 0` where `n = read_pairs` and
+/// `c = unique_read_pairs`. Bracket is doubled (×10) until `f(M × c) > 0`,
+/// then 40 bisection iterations.
+///
+/// Returns `None` when the estimate is undefined:
+/// - zero pairs examined
+/// - zero duplicates (Picard returns null field)
+/// - unique ≥ total (Picard throws `IllegalStateException`; we return None)
+pub fn estimate_library_size(pairs_examined: u64, pair_duplicates: u64) -> Option<u64> {
+    if pairs_examined == 0 || pair_duplicates == 0 {
+        return None;
     }
 
-    // Newton's method: solve f(x) = c/x - 1 + exp(-n/x) = 0
-    // f'(x) = -c/x^2 + n/x^2 * exp(-n/x)
-    let mut x = c * c / (c - (n - c).max(1.0)); // Initial guess
-    if x <= 0.0 {
-        x = n; // Fallback
+    let read_pairs = pairs_examined as f64;
+    let unique_read_pairs = (pairs_examined - pair_duplicates) as f64;
+
+    if unique_read_pairs >= read_pairs || unique_read_pairs <= 0.0 {
+        return None;
     }
 
-    for _ in 0..100 {
-        let exp_term = (-n / x).exp();
-        let f = c / x - 1.0 + exp_term;
-        let f_prime = -c / (x * x) + n / (x * x) * exp_term;
+    // Picard's f(x, c, n) with x as the size multiplier of unique_read_pairs (c):
+    //   library_size = x * c
+    //   c / library_size = 1 / x
+    //   n / library_size = n / (x * c) = read_pairs / (x * unique_read_pairs)
+    //   f = 1/x - 1 + exp(-n / library_size)
+    // Root of f defines library_size; we search for x in [1, 100] growing upward.
+    let f = |x: f64| -> f64 {
+        1.0 / x - 1.0 + (-read_pairs / (x * unique_read_pairs)).exp()
+    };
 
-        if f_prime.abs() < 1e-20 {
-            break;
-        }
+    let mut m: f64 = 1.0;
+    let mut big_m: f64 = 100.0;
 
-        let x_new = x - f / f_prime;
-        if (x_new - x).abs() < 1.0 {
-            x = x_new;
-            break;
-        }
-        x = x_new;
-
-        if x <= 0.0 {
-            x = n;
-            break;
+    // Grow the upper bracket until f(big_m) > 0 (matches Picard loop).
+    while f(big_m) > 0.0 {
+        big_m *= 10.0;
+        if big_m > 1e12 {
+            return None; // numerical blow-up guard
         }
     }
 
-    x.round().max(0.0) as u64
+    // 40 bisection iterations (Picard constant).
+    for _ in 0..40 {
+        let mid = (m + big_m) / 2.0;
+        let fm = f(mid);
+        if fm == 0.0 {
+            m = mid;
+            big_m = mid;
+            break;
+        } else if fm > 0.0 {
+            m = mid;
+        } else {
+            big_m = mid;
+        }
+    }
+
+    let est = unique_read_pairs * (m + big_m) / 2.0;
+    if est.is_finite() && est > 0.0 {
+        Some(est as u64)
+    } else {
+        None
+    }
 }
 
 /// Write Picard-format metrics file.
@@ -111,7 +128,9 @@ pub fn write_metrics(
 
     let version = env!("CARGO_PKG_VERSION");
     let pct = percent_duplication(counters);
-    let est = estimate_library_size(counters.read_pairs_examined, counters.read_pair_duplicates);
+    let est_opt = estimate_library_size(counters.read_pairs_examined, counters.read_pair_duplicates);
+    // Picard writes an empty field (no value after the TAB) when the estimate is null.
+    let est_str = est_opt.map(|v| v.to_string()).unwrap_or_default();
 
     // Header
     writeln!(f, "## htsjdk.samtools.metrics.StringHeader")?;
@@ -137,7 +156,8 @@ pub fn write_metrics(
          ESTIMATED_LIBRARY_SIZE"
     )?;
 
-    // Data row (single library for now)
+    // Data row (single library for now).
+    // ESTIMATED_LIBRARY_SIZE may be empty when undefined (zero dups, single-end-only, etc.).
     writeln!(
         f,
         "default\t{}\t{}\t{}\t{}\t{}\t{}\t0\t{:.6}\t{}",
@@ -148,7 +168,7 @@ pub fn write_metrics(
         counters.unpaired_read_duplicates,
         counters.read_pair_duplicates,
         pct,
-        est
+        est_str
     )?;
 
     // Blank line before histogram
@@ -221,26 +241,38 @@ mod tests {
     }
 
     #[test]
-    fn library_size_no_dups() {
-        assert_eq!(estimate_library_size(50000, 0), 50000);
+    fn library_size_no_dups_returns_none() {
+        // Picard: zero duplicates → null (empty field).
+        assert_eq!(estimate_library_size(50000, 0), None);
     }
 
     #[test]
-    fn library_size_zero() {
-        assert_eq!(estimate_library_size(0, 0), 0);
+    fn library_size_zero_pairs_returns_none() {
+        assert_eq!(estimate_library_size(0, 0), None);
     }
 
     #[test]
-    fn library_size_all_dups() {
-        assert_eq!(estimate_library_size(100, 100), 0);
+    fn library_size_all_dups_returns_none() {
+        // Picard throws IllegalStateException; we return None (documented).
+        assert_eq!(estimate_library_size(100, 100), None);
     }
 
     #[test]
-    fn library_size_normal() {
-        // With 90481 pairs and 11688 dups, library size should be a large positive number
-        let est = estimate_library_size(90481, 11688);
-        assert!(est > 0);
-        assert!(est > 90481); // Library should be larger than observed pairs
+    fn library_size_normal_estimate_is_plausible() {
+        // 90481 pairs observed, 11688 dups → ~78793 unique. Library must be larger than unique.
+        let est = estimate_library_size(90481, 11688).expect("defined estimate");
+        assert!(est > 78793, "library size {} should exceed unique count", est);
+        // Sanity: for ~13% dup rate the library is finite and not absurd.
+        assert!(est < 10_000_000, "library size {} is implausibly large", est);
+    }
+
+    #[test]
+    fn library_size_bisection_converges_on_yeast_sample() {
+        // WT_REP1 ground truth: 180342 reads total, ~36810 dups flagged.
+        // Pair-level (approx): the estimate should be finite and well above unique count.
+        let est = estimate_library_size(90171, 18405).expect("defined estimate");
+        let unique = 90171 - 18405;
+        assert!(est > unique, "{} should exceed unique {}", est, unique);
     }
 
     #[test]

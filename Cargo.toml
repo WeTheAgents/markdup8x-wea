@@ -19,6 +19,9 @@ tempfile = "3"
 
 [dev-dependencies]
 noodles = { version = "0.96", features = ["bam", "sam", "bgzf", "core"] }
+bstr = "1"
+tempfile = "3"
+anyhow = "1"
 
 [profile.release]
 lto = true

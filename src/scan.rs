@@ -23,11 +23,17 @@ fn build_library_map(header: &sam::Header) -> FxHashMap<Vec<u8>, u8> {
     let mut rg_to_lib: FxHashMap<Vec<u8>, u8> = FxHashMap::default();
 
     for (id, rg) in header.read_groups().iter() {
+        // Picard library fallback (research §6): LB → RG ID → error.
+        // If LB tag is absent, use the @RG ID as the library name so reads from
+        // that RG form a distinct group, matching Picard's LibraryIdGenerator.
         let lib_name = rg
             .other_fields()
             .get(&LIBRARY)
             .map(|v| String::from_utf8_lossy(v.as_ref()).to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| {
+                let id_bytes: &[u8] = id.as_ref();
+                String::from_utf8_lossy(id_bytes).to_string()
+            });
 
         let lib_idx = if let Some(idx) = lib_names.iter().position(|n| n == &lib_name) {
             idx as u8
@@ -160,7 +166,7 @@ pub fn scan_pass(
                     unclipped_5prime: uc5,
                     is_reverse,
                 },
-                ScoredSingle { score: qsum, record_id: current_id },
+                ScoredSingle { score: qsum, record_id: current_id, is_paired_marker: false },
                 &mut dup_bits,
             );
         } else {
@@ -171,7 +177,7 @@ pub fn scan_pass(
                     b
                 })
                 .unwrap_or(b"");
-            let nh = qname_hash(qname_bytes);
+            let nh = qname_hash(qname_bytes, lib_idx);
             let ch = check_hash(qname_bytes);
             let mate_tid = record
                 .mate_reference_sequence_id()
@@ -188,12 +194,43 @@ pub fn scan_pass(
                 .map(|p| (usize::from(p) as i64) - 1)
                 .unwrap_or(-1);
 
+            // Insert a fragment-group marker at this read's single-end key.
+            // Picard (§4 of research): paired reads always beat fragments at
+            // the same locus, so any fragment landing in this group must be
+            // flagged unconditionally. Insert inline at observation time —
+            // that way retroactive insertion is never needed, because
+            // coordinate-sort guarantees the SingleEndTracker is at this key
+            // right now. Marker score=0, record_id=current_id (unused unless
+            // something dereferences the Vec entry; the resolve code skips
+            // markers before flagging).
+            single_tracker.add_read(
+                SingleEndKey {
+                    library_idx: lib_idx,
+                    ref_id: tid_i32,
+                    unclipped_5prime: uc5,
+                    is_reverse,
+                },
+                ScoredSingle { score: 0, record_id: current_id, is_paired_marker: true },
+                &mut dup_bits,
+            );
+
             if let Some(mate) = pending.remove(nh, ch) {
-                let (ref_lo, pos_lo, rev_lo, ref_hi, pos_hi, rev_hi) =
+                let (ref_lo, pos_lo, rev_lo_raw, ref_hi, pos_hi, rev_hi_raw) =
                     if (tid_i32, uc5) <= (mate.ref_id, mate.unclipped_5prime) {
                         (tid_i32, uc5, is_reverse, mate.ref_id, mate.unclipped_5prime, mate.is_reverse)
                     } else {
                         (mate.ref_id, mate.unclipped_5prime, mate.is_reverse, tid_i32, uc5, is_reverse)
+                    };
+
+                // Picard same-position RF→FR normalization (MarkDuplicates §3 of research).
+                // When both reads land at identical (ref, unclipped_5') and the orientation
+                // after lo/hi ordering is RF (rev_lo=true, rev_hi=false), Picard forces it
+                // to FR so RF and FR at the same locus group as one duplicate set.
+                let (rev_lo, rev_hi) =
+                    if ref_lo == ref_hi && pos_lo == pos_hi && rev_lo_raw && !rev_hi_raw {
+                        (false, true)
+                    } else {
+                        (rev_lo_raw, rev_hi_raw)
                     };
 
                 paired_tracker.add_pair(
@@ -236,7 +273,12 @@ pub fn scan_pass(
 
     counters.read_pairs_examined = paired_tracker.pairs_examined;
     counters.read_pair_duplicates = paired_tracker.pair_duplicates;
-    counters.unpaired_reads_examined = single_tracker.reads_examined;
+    // Picard (research §7): an orphan paired read (mate never arrives)
+    // is counted as one `UNPAIRED_READS_EXAMINED`. We also leave the
+    // paired-marker inserted at its locus — see deviations.md for the
+    // known divergence where an orphan cannot compete with a co-located
+    // fragment by score; markers always win at that locus.
+    counters.unpaired_reads_examined = single_tracker.reads_examined + orphans.len() as u64;
     counters.unpaired_read_duplicates = single_tracker.read_duplicates;
     counters.merge_histogram(&paired_tracker.group_sizes);
     counters.merge_histogram(&single_tracker.group_sizes);

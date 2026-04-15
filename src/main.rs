@@ -2,15 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use log::info;
 
-mod dupset;
-mod groups;
-mod io;
-mod markdup;
-mod metrics;
-mod pending_mates;
-mod position;
-mod scan;
-mod scoring;
+use markdup_wea::markdup;
 
 #[derive(Parser)]
 #[command(name = "markdup-wea")]

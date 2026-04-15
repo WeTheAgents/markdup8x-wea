@@ -38,10 +38,18 @@ pub struct ScoredPair {
 }
 
 /// A scored single-end read in a duplicate group.
+///
+/// `is_paired_marker=true` denotes a placeholder inserted when a read of a
+/// properly-paired pair is encountered at this position. Per Picard (research
+/// §4), when any such marker sits in a fragment group, every non-marker
+/// (i.e. true single-end/orphan fragment) in that group is unconditionally
+/// flagged as a duplicate regardless of score — paired reads always beat
+/// fragments at the same locus.
 #[derive(Clone, Debug)]
 pub struct ScoredSingle {
     pub score: u32,
     pub record_id: u64,
+    pub is_paired_marker: bool,
 }
 
 /// Tracks active paired-end duplicate groups and resolves them incrementally.
@@ -186,13 +194,18 @@ impl SingleEndTracker {
     }
 
     /// Add a single-end read. If key differs from current group, resolve the current group first.
+    ///
+    /// `reads_examined` counts only real fragments (not paired markers), to
+    /// match Picard's `UNPAIRED_READS_EXAMINED` semantics.
     pub fn add_read(
         &mut self,
         key: SingleEndKey,
         scored: ScoredSingle,
         dup_bits: &mut dyn DupSet,
     ) {
-        self.reads_examined += 1;
+        if !scored.is_paired_marker {
+            self.reads_examined += 1;
+        }
 
         if self.current_key.as_ref() != Some(&key) {
             // New group — resolve previous
@@ -214,12 +227,35 @@ impl SingleEndTracker {
             return;
         }
 
-        if size >= self.group_sizes.len() {
-            self.group_sizes.resize(size + 1, 0);
+        // Histogram counts only real fragments, not paired markers.
+        let fragment_count = self
+            .current_group
+            .iter()
+            .filter(|s| !s.is_paired_marker)
+            .count();
+        if fragment_count >= self.group_sizes.len() {
+            self.group_sizes.resize(fragment_count + 1, 0);
         }
-        self.group_sizes[size] += 1;
+        if fragment_count > 0 {
+            self.group_sizes[fragment_count] += 1;
+        }
 
-        if size <= 1 {
+        let has_paired_marker = self.current_group.iter().any(|s| s.is_paired_marker);
+
+        if has_paired_marker {
+            // Picard §4: every real fragment at a locus with any paired-read
+            // presence is unconditionally flagged regardless of score.
+            for read in self.current_group.iter() {
+                if !read.is_paired_marker {
+                    dup_bits.insert(read.record_id);
+                    self.read_duplicates += 1;
+                }
+            }
+            self.current_group.clear();
+            return;
+        }
+
+        if fragment_count <= 1 {
             self.current_group.clear();
             return;
         }
@@ -429,6 +465,7 @@ mod tests {
             ScoredSingle {
                 score: 500,
                 record_id: 0,
+                is_paired_marker: false,
             },
             &mut dup_bits,
         );
@@ -437,6 +474,7 @@ mod tests {
             ScoredSingle {
                 score: 300,
                 record_id: 1,
+                is_paired_marker: false,
             },
             &mut dup_bits,
         );
@@ -453,6 +491,7 @@ mod tests {
             ScoredSingle {
                 score: 400,
                 record_id: 2,
+                is_paired_marker: false,
             },
             &mut dup_bits,
         );
@@ -504,5 +543,60 @@ mod tests {
         tracker.resolve_all(&mut dup_bits);
         // Different libraries → different groups → no dups
         assert_eq!(dup_bits.len(), 0);
+    }
+
+    #[test]
+    fn fragment_loses_to_paired_marker_regardless_of_score() {
+        // Picard §4: a paired marker in the group flags every fragment,
+        // even if the fragment's quality score is higher.
+        let mut tracker = SingleEndTracker::new();
+        let mut dup_bits = BitVecDupSet::new();
+
+        let key = SingleEndKey {
+            library_idx: 0,
+            ref_id: 0,
+            unclipped_5prime: 1000,
+            is_reverse: false,
+        };
+
+        // High-score fragment first
+        tracker.add_read(
+            key.clone(),
+            ScoredSingle { score: 999, record_id: 7, is_paired_marker: false },
+            &mut dup_bits,
+        );
+        // Then a paired marker (zero score) — marker must still win
+        tracker.add_read(
+            key,
+            ScoredSingle { score: 0, record_id: 42, is_paired_marker: true },
+            &mut dup_bits,
+        );
+        tracker.flush(&mut dup_bits);
+
+        assert!(dup_bits.contains(7), "fragment must be flagged when pair present");
+        assert!(!dup_bits.contains(42), "paired marker is not a fragment duplicate");
+        assert_eq!(tracker.read_duplicates, 1);
+        assert_eq!(tracker.reads_examined, 1); // marker does not count
+    }
+
+    #[test]
+    fn paired_marker_alone_flags_nothing() {
+        let mut tracker = SingleEndTracker::new();
+        let mut dup_bits = BitVecDupSet::new();
+
+        let key = SingleEndKey {
+            library_idx: 0,
+            ref_id: 0,
+            unclipped_5prime: 1000,
+            is_reverse: false,
+        };
+        tracker.add_read(
+            key,
+            ScoredSingle { score: 0, record_id: 1, is_paired_marker: true },
+            &mut dup_bits,
+        );
+        tracker.flush(&mut dup_bits);
+        assert_eq!(dup_bits.len(), 0);
+        assert_eq!(tracker.reads_examined, 0);
     }
 }

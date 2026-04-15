@@ -44,14 +44,16 @@ pub fn run(
     info!("Pass 2: writing output...");
     let (mut reader2, header2) = io::open_bam(&actual_path)?;
 
-    // Write to file or stdout
-    let mut writer: bam::io::Writer<Box<dyn std::io::Write>> = if let Some(p) = output {
-        let f = std::fs::File::create(p).with_context(|| format!("Failed to create: {}", p))?;
-        bam::io::Writer::from(Box::new(std::io::BufWriter::new(f)) as Box<dyn std::io::Write>)
-    } else {
-        let stdout = std::io::stdout().lock();
-        bam::io::Writer::from(Box::new(std::io::BufWriter::new(stdout)) as Box<dyn std::io::Write>)
-    };
+    // Write to file or stdout. bam::io::Writer::new() wraps the underlying writer in BGZF;
+    // Writer::from() does NOT — must use ::new() to produce a valid BAM file.
+    let mut writer: bam::io::Writer<noodles::bgzf::io::Writer<Box<dyn std::io::Write>>> =
+        if let Some(p) = output {
+            let f = std::fs::File::create(p).with_context(|| format!("Failed to create: {}", p))?;
+            bam::io::Writer::new(Box::new(std::io::BufWriter::new(f)) as Box<dyn std::io::Write>)
+        } else {
+            let stdout = std::io::stdout().lock();
+            bam::io::Writer::new(Box::new(std::io::BufWriter::new(stdout)) as Box<dyn std::io::Write>)
+        };
 
     writer.write_header(&header2)?;
 
@@ -82,6 +84,8 @@ pub fn run(
 
         record_id += 1;
     }
+
+    writer.try_finish()?;
 
     info!(
         "Pass 2 done: {} written, {} flagged{}",

@@ -1,143 +1,153 @@
 # Tasks
 
-## 1. Project Skeleton (Phase 1)
+## Guiding principle (revised 2026-04-15)
 
-- [ ] 1.1 Initialize Cargo.toml with rust-htslib (static), clap 4, anyhow, log, env_logger, rustc-hash, bitvec, tempfile
-- [ ] 1.2 Configure release profile: lto=true, codegen-units=1, strip=true, opt-level=3
-- [ ] 1.3 Create src/main.rs with clap CLI: INPUT, -o, -M, -@, --remove-duplicates, --assume-sort-order
-- [ ] 1.4 Create src/lib.rs with public module re-exports
-- [ ] 1.5 Create LICENSE (MIT)
-- [ ] 1.6 Create README.md (project description, usage, build instructions)
+**Goal is NOT "better than Picard". Goal is "byte-for-byte identical FLAG 0x400 output + Picard-compatible metrics, without JVM".**
+
+Burden of evidence for replacing a critical bioinformatics tool is enormous. The nf-core community is conservative (biologists/medics, not programmers); they care that the tool **works as expected**, not that it's faster. The Sambamba cautionary tale (silent R1/R2 reorder broke downstream methylation extraction, FelixKrueger/Bismark#170) is the failure mode we must avoid.
+
+**Scope discipline:**
+- Correctness > speed. Threading/optimization is post-MVP.
+- Every deviation from Picard must be *documented*, not discovered.
+- Deliverable for maintainers: "identical outputs on N BAMs + deviation table + known edge-case coverage". Let them decide if they want it.
+
+**Out of scope for MVP (deferred to post-acceptance):**
+- Threading optimization (Phase 4 — `-@` flag accepted but no-op)
+- Human genome validation at full scale (Phase 5b — yeast + 1 human sample is enough for maintainer review)
+- crates.io publishing, GitHub Release automation (Phase 10 — maintainers' call)
+- Optical duplicate detection (not used by nf-core/rnaseq; will be documented as unsupported)
+
+## 1. Project Skeleton (Phase 1) — DONE
+
+- [x] 1.1 Initialize Cargo.toml (noodles chosen over rust-htslib: no C dep, simpler static build)
+- [x] 1.2 Configure release profile: lto=true, codegen-units=1, strip=true, opt-level=3
+- [x] 1.3 Create src/main.rs with clap CLI: INPUT, -o, -M, -@, --remove-duplicates, --assume-sort-order
+- [x] 1.4 Create src/lib.rs with public module re-exports
+- [x] 1.5 Create LICENSE (MIT)
+- [ ] 1.6 Create README.md (project description, usage, build instructions) — deferred until Phase 5a passes
 - [ ] 1.7 Create .github/workflows/ci.yml (build, test, clippy, fmt on Linux/macOS/Windows)
 
-### GATE: `cargo build --release` compiles. CI green.
+### GATE: `cargo build --release` compiles. CI green. — PARTIAL (build OK, CI not wired)
 
-## 2. Core Primitives (Phase 1)
+## 2. Core Primitives (Phase 1) — DONE
 
-- [ ] 2.1 Implement src/position.rs: `unclipped_5prime(record) -> i64` with forward/reverse/clip handling
-- [ ] 2.2 Unit tests for position.rs: forward no-clip, forward soft-clip, reverse soft-clip, hard-clip, mixed, empty CIGAR, spliced alignment
-- [ ] 2.3 Implement src/scoring.rs: `quality_sum(record) -> u32` (sum bases with Q >= 15)
-- [ ] 2.4 Unit tests for scoring.rs: all-high-Q, all-low-Q, mixed, empty quals, edge at Q=15
-- [ ] 2.5 Implement src/io.rs: open_reader (file + stdin detection), open_writer, validate_sort_order
-- [ ] 2.6 Implement runtime sort-order check in io.rs: track (prev_ref_id, prev_pos), error on violation
-- [ ] 2.7 Implement stdin temp-file buffering using tempfile crate
-- [ ] 2.8 Unit tests for io.rs: valid SO, missing SO, wrong SO, runtime out-of-order, stdin detection
+- [x] 2.1–2.8 position.rs, scoring.rs, io.rs + unit tests (45/45 green)
 
-### GATE: All unit tests pass. `markdup-wea input.bam -o output.bam` copies BAM unchanged. Clippy clean.
+### GATE: All unit tests pass. — PASSED
 
-## 3. Paired-End Duplicate Detection (Phase 2)
+## 3. Paired-End Duplicate Detection (Phase 2) — DONE
 
-- [ ] 3.1 Implement src/pending_mates.rs: PendingMate struct (#[repr(C, packed)], 52 bytes), FxHashMap<u64, PendingMate>
-- [ ] 3.2 Implement QNAME hashing: 64-bit FxHash primary, 32-bit check_hash (first 4 bytes of QNAME)
-- [ ] 3.3 Implement hash collision detection: check_hash mismatch → treat as new pending mate
-- [ ] 3.4 Implement src/groups.rs: PairedEndKey, SingleEndKey, ScoredPair, GroupTracker
-- [ ] 3.5 Implement PairedEndKey ordering: lo/hi by (ref_id, unclipped_5prime) ascending
-- [ ] 3.6 Implement incremental group resolution: BTreeMap<i64, Vec<GroupId>>, drain on stream advance
-- [ ] 3.7 Implement chromosome boundary resolution: resolve all groups for prev chromosome
-- [ ] 3.8 Implement EOF resolution: resolve all remaining groups (cross-chromosome, stragglers)
-- [ ] 3.9 Implement src/scan.rs: Pass 1 orchestrator — classify records, route to grouping, return dup_bits
-- [ ] 3.10 Implement record classification: unmapped, secondary, supplementary, paired-mate-unmapped, paired-both-mapped, single-end
-- [ ] 3.11 Implement library detection from @RG headers (ID → LB mapping)
-- [ ] 3.12 Implement single-end inline grouping (consecutive reads with same SingleEndKey)
-- [ ] 3.13 Implement mate-unmapped routing to single-end grouping
-- [ ] 3.14 Implement orphan read handling: warn to stderr at EOF, pass through unflagged
-- [ ] 3.15 Implement src/markdup.rs: two-pass orchestrator (scan → dup_bits → reset → write)
-- [ ] 3.16 Implement pre-existing flag clearing: clear FLAG 0x400 on input before grouping
-- [ ] 3.17 Implement --remove-duplicates mode: skip records in dup_bits during Pass 2
+- [x] 3.1–3.17 pending_mates, groups, scan, markdup, library detection, flag clearing, --remove-duplicates
 
-### GATE: All unit tests pass.
+### GATE: All unit tests pass. — PASSED
 
-## 4. DupSet Strategies (Phase 2)
+## 4. DupSet Strategies (Phase 2) — DONE
 
-- [ ] 4.1 Define DupSet trait: insert(record_id), contains(record_id) -> bool
-- [ ] 4.2 Implement BitVecDupSet: bitvec::BitVec, grow-on-demand
-- [ ] 4.3 Implement HashDupSet: FxHashSet<u64>
-- [ ] 4.4 Wire strategy selection (feature flag or runtime flag)
-- [ ] 4.5 Test: both strategies produce identical output on synthetic BAM
+- [x] 4.1–4.5 BitVec + HashSet strategies, identical-output test
 
-### GATE: Both strategies compile and pass identical-output test.
+### GATE: Both strategies compile and pass identical-output test. — PASSED
 
-## 5. Synthetic BAM Integration Tests (Phase 2)
+## 5. Picard Edge-Case Research (NEW — Phase 2.5)
 
-- [ ] 5.1 Create test fixture: two identical pairs at same position → one flagged
-- [ ] 5.2 Create test fixture: pair with higher quality wins over lower
-- [ ] 5.3 Create test fixture: single-end reads mixed with paired
-- [ ] 5.4 Create test fixture: mate on different chromosome → both reads flagged
-- [ ] 5.5 Create test fixture: mate unmapped → single-end treatment
-- [ ] 5.6 Create test fixture: supplementary read of dup primary → NOT flagged
-- [ ] 5.7 Create test fixture: pre-existing FLAG 0x400 → cleared and re-evaluated
-- [ ] 5.8 Create test fixture: orphan read (no mate in BAM) → pass through with warning
-- [ ] 5.9 Create test fixture: multiple libraries → separate grouping
-- [ ] 5.10 Create test fixture: runtime sort-order violation → error exit
-- [ ] 5.11 Wire all fixtures into tests/integration.rs with assertions on FLAG values
+**Blocker for Phase 6+. Sambamba-proofing.**
 
-### GATE: All 10 synthetic test scenarios pass on both DupSet strategies.
+- [ ] 5.1 Receive `docs/picard-edge-cases.md` from research team (external deep-research task)
+- [ ] 5.2 Cross-reference each edge case against current `openspec/changes/mvp/specs/` — mark covered / uncovered / divergent
+- [ ] 5.3 For each **uncovered** case: decide cover-in-MVP vs document-as-deviation
+- [ ] 5.4 For each **divergent** case: fix to match Picard OR document rationale in deviation table
+- [ ] 5.5 Create `docs/deviations.md` — explicit table of all known behavioral differences vs Picard (even if empty, its existence signals we thought about it)
+- [ ] 5.6 Backfill unit tests for every edge case we claim to cover
 
-## 6. Picard-Compatible Metrics (Phase 3)
+### GATE: Every high-risk edge case from research doc is either covered by test or listed in deviations.md.
 
-- [ ] 6.1 Implement src/metrics.rs: MetricsCounters struct (per-library counters)
-- [ ] 6.2 Implement counter accumulation during Pass 1 scan
-- [ ] 6.3 Implement PERCENT_DUPLICATION calculation
-- [ ] 6.4 Implement ESTIMATED_LIBRARY_SIZE via Lander-Waterman / Newton's method
-- [ ] 6.5 Implement edge cases: zero dups, all dups, zero examined
-- [ ] 6.6 Implement duplicate group size histogram tracking
-- [ ] 6.7 Implement metrics file writer with exact Picard header format (TAB-separated, htsjdk headers)
-- [ ] 6.8 Implement per-library rows when multiple libraries present
-- [ ] 6.9 Unit tests: PERCENT_DUPLICATION formula, library size estimation, edge cases
-- [ ] 6.10 Integration test: metrics file format matches Picard template character-by-character
+## 6. Synthetic BAM Integration Tests (Phase 3)
 
-### GATE: Metrics file is parseable by MultiQC (manual test with `multiqc .`).
+**Goal: exercise edge cases identified in Phase 5 on controllable inputs before real BAMs.**
 
-## 7. Threading + Optimization (Phase 4)
+- [ ] 6.1 Create test fixture: two identical pairs at same position → one flagged
+- [ ] 6.2 Create test fixture: pair with higher quality wins over lower
+- [ ] 6.3 Create test fixture: quality tie → tie-break matches Picard rule (from edge-case doc)
+- [ ] 6.4 Create test fixture: single-end reads mixed with paired
+- [ ] 6.5 Create test fixture: mate on different chromosome (chimeric pair) — verify both flagged per Picard rule
+- [ ] 6.6 Create test fixture: mate unmapped → single-end treatment
+- [ ] 6.7 Create test fixture: supplementary/secondary of dup primary — verify Picard-matching behavior
+- [ ] 6.8 Create test fixture: pre-existing FLAG 0x400 → cleared and re-evaluated
+- [ ] 6.9 Create test fixture: orphan read (no mate in BAM) → pass through with stderr warning
+- [ ] 6.10 Create test fixture: multiple libraries → separate grouping
+- [ ] 6.11 Create test fixture: runtime sort-order violation → error exit
+- [ ] 6.12 Create test fixture: spliced reads (N in CIGAR) — RNA-seq critical
+- [ ] 6.13 Create test fixture: missing @RG / missing LB → Picard fallback behavior
+- [ ] 6.14 Wire all fixtures into tests/integration.rs with FLAG-level assertions
+- [ ] 6.15 Every fixture runs against BOTH dupset strategies
 
-- [ ] 7.1 Wire -@ flag to hts_set_threads() for BGZF decompression/compression
-- [ ] 7.2 Implement record reuse: reader.read(&mut record) pattern in both passes
-- [ ] 7.3 Pre-size FxHashMap from BAM file size estimate
-- [ ] 7.4 Add logging: record count, pending_mates peak, groups resolved, wall time per pass
+### GATE: All synthetic scenarios pass on both DupSet strategies. Fixture inputs/outputs committed to repo for reproducibility.
 
-### GATE: `markdup-wea -@ 4` produces correct output. Performance log shows thread utilization.
+## 7. Picard-Compatible Metrics (Phase 3)
 
-## 8. Yeast Validation (Phase 5a)
+- [x] 7.1–7.6 metrics.rs skeleton (already done in Phase 2)
+- [ ] 7.7 Implement metrics file writer with exact Picard header format (verified byte-exact against Picard template from edge-case research)
+- [ ] 7.8 Per-library rows when multiple libraries present
+- [ ] 7.9 Integration test: metrics file diff vs Picard output on synthetic BAM — zero-byte diff target
+- [ ] 7.10 MultiQC parse test: `multiqc .` consumes our metrics file without warnings
 
-- [ ] 8.1 Acquire yeast test BAMs: run `nf-core/rnaseq -profile test,docker --skip_markduplicates`
-- [ ] 8.2 Document BAM acquisition in tests/README.md
-- [ ] 8.3 Run markdup-wea on all 5 yeast samples, compare dup counts to ground truth:
+### GATE: Metrics file byte-identical to Picard on at least one synthetic input. MultiQC parseable.
+
+## 8. Record-Reuse + Minimal Logging (lightweight — no threading)
+
+- [ ] 8.1 Ensure `reader.read(&mut record)` reuse pattern in both passes (no per-record allocation)
+- [ ] 8.2 Pre-size FxHashMap from BAM file size estimate
+- [ ] 8.3 Log: record count, pending_mates peak, groups resolved, wall time per pass
+- [ ] 8.4 `-@` flag: accept, no-op for MVP, log "threading not implemented"
+
+### GATE: Single-threaded run completes yeast BAM without OOM. Logs are useful for debugging.
+
+## 9. Yeast Validation (Phase 5a — CRITICAL GATE)
+
+**This is THE correctness gate. Maintainer decision hinges on this.**
+
+- [ ] 9.1 Acquire 5 yeast test BAMs (run `nf-core/rnaseq -profile test,docker --skip_markduplicates`)
+- [ ] 9.2 Document BAM acquisition in `tests/README.md`
+- [ ] 9.3 For each sample, assert: **`samtools view -f 1024 <our>.bam | cut -f1 | sort -u`** is **byte-identical** to the same pipeline on Picard output. Not just counts — every single flagged QNAME.
+- [ ] 9.4 Dup count ground truth:
   - WT_REP1: 36,810 / 180,342
   - WT_REP2: 11,688 / 90,962
   - RAP1_UNINDUCED_REP2: 78,929 / 98,201
   - RAP1_UNINDUCED_REP1: 36,294 / 48,977
   - RAP1_IAA_30M_REP1: 11,094 / 48,347
-- [ ] 8.4 If any count differs: diff flagged reads (`samtools view -f 1024`), isolate divergence
-- [ ] 8.5 Run MultiQC on markdup-wea metrics, verify duplication plot
-- [ ] 8.6 Compare metrics values to Picard's metrics on same samples
-- [ ] 8.7 Benchmark both DupSet strategies on all 5 samples: wall time (hyperfine), peak RSS (/usr/bin/time -v)
-- [ ] 8.8 Pick DupSet winner. If negligible difference → keep BitVec.
-- [ ] 8.9 Test stdin piping: `cat yeast.bam | markdup-wea - -o out.bam`
-- [ ] 8.10 Test --remove-duplicates produces correct count
-- [ ] 8.11 Verify static binary size < 10MB
+- [ ] 9.5 If any QNAME differs: isolate by `diff`, trace to edge case, fix OR add to deviations.md with rationale
+- [ ] 9.6 Metrics file diff: our `.metrics.txt` vs Picard `.metrics.txt` — zero-byte diff target (or documented fields)
+- [ ] 9.7 MultiQC: `multiqc .` on our outputs, verify duplication plot renders identically
+- [ ] 9.8 stdin pipe test: `cat yeast.bam | markdup-wea - -o out.bam` produces same result
+- [ ] 9.9 `--remove-duplicates` produces correct kept-record count
+- [ ] 9.10 Static binary size check: `strip`ped release binary < 10MB
 
-### GATE: All 5 yeast samples match Picard. Metrics parseable by MultiQC. DupSet strategy decided. This gate MUST pass before proceeding to Phase 5b.
+### GATE: All 5 yeast samples — byte-identical flagged QNAME set + Picard-parseable metrics. Any deviation explicitly in deviations.md. This is the go/no-go point.
 
-## 9. Human Genome Validation (Phase 5b)
+## 10. Single Human Sample Smoke Test (Phase 5b-lite)
 
-- [ ] 9.1 Deploy markdup-wea to cloud benchmark server (existing infra in domains/rnaseq/benchmark/)
-- [ ] 9.2 Run on all 8 ENCODE human RNA-seq samples (166M-230M reads each)
-- [ ] 9.3 Compare dup counts to Picard ground truth for all 8 samples
-- [ ] 9.4 If any count differs: investigate and document
-- [ ] 9.5 Benchmark: Picard vs samtools (t=1,4,8) vs markdup-wea (t=1,4,8), 3 runs each
-- [ ] 9.6 Measure peak RSS with /usr/bin/time -v
-- [ ] 9.7 Log pending_mates peak count for memory analysis
-- [ ] 9.8 Create benchmarks/ directory with scripts and CSV results
-- [ ] 9.9 Publish performance comparison table in README
+**Not full benchmark — just proof it scales. Maintainers can run the full suite if they want.**
 
-### GATE: All 8 human samples match Picard. Peak RSS < target. Performance competitive with Picard.
+- [ ] 10.1 One ENCODE human RNA-seq sample (~200M reads)
+- [ ] 10.2 Assert flagged-QNAME set identical to Picard
+- [ ] 10.3 Record wall time + peak RSS for reference (not a claim, a data point)
+- [ ] 10.4 Log pending_mates peak for sizing confidence
 
-## 10. Release Preparation
+### GATE: One human sample matches Picard. No OOM, no crash.
 
-- [ ] 10.1 Update README with benchmark table, usage examples, deviation table
-- [ ] 10.2 Add CHANGELOG.md with v0.1.0 entry
-- [ ] 10.3 Configure GitHub Actions release workflow: build static binaries for Linux x86_64, macOS arm64, Windows x86_64
-- [ ] 10.4 Tag v0.1.0 and create GitHub Release with binaries
-- [ ] 10.5 Publish to crates.io (cargo publish)
+## 11. Handoff Package (for maintainers)
 
-### GATE: v0.1.0 released. Binary downloadable. `cargo install markdup-wea` works.
+- [ ] 11.1 README: what it is, what it isn't, known deviations, how to build, how to run
+- [ ] 11.2 `docs/deviations.md` — final version, all known differences vs Picard
+- [ ] 11.3 `docs/picard-edge-cases.md` — research doc + our coverage status
+- [ ] 11.4 `BENCHMARK.md` — observed numbers from yeast + 1 human, with methodology. Framed as "data point", not "we are better"
+- [ ] 11.5 Draft nf-core Slack/GitHub post explaining scope, non-goals, and what we're asking maintainers to decide
+
+### GATE: A maintainer can read the handoff package in 20 minutes and decide yes/no without running anything themselves.
+
+## Deferred (not MVP)
+
+- Threading (`-@`) actual implementation — post-acceptance optimization
+- Full 8-sample human benchmark — maintainers' call
+- crates.io / GitHub Release automation — maintainers' call
+- Optical duplicate detection — documented as unsupported
+- Windows binary — Linux x86_64 is enough for nf-core; macOS/Windows post-acceptance

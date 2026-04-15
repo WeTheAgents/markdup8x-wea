@@ -20,10 +20,17 @@ pub struct PendingMate {
     pub library_idx: u8,
 }
 
-/// Compute 64-bit FxHash of a QNAME byte slice.
-pub fn qname_hash(qname: &[u8]) -> u64 {
+/// Compute 64-bit FxHash of a QNAME byte slice, scoped by library.
+///
+/// Picard (research §15) keys its mate lookup by `readGroupId + readName` so
+/// reads with identical QNAMEs in different read groups do not accidentally
+/// pair. We use `library_idx` (post-@RG resolution) for the same effect —
+/// this matches Picard's semantics because Picard itself groups read groups
+/// by their `LB` field when assigning library IDs.
+pub fn qname_hash(qname: &[u8], library_idx: u8) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
+    library_idx.hash(&mut hasher);
     qname.hash(&mut hasher);
     std::hash::Hasher::finish(&hasher)
 }
@@ -105,7 +112,7 @@ mod tests {
 
     fn make_pending(qname: &[u8], record_id: u64) -> PendingMate {
         PendingMate {
-            name_hash: qname_hash(qname),
+            name_hash: qname_hash(qname, 0),
             check_hash: check_hash(qname),
             ref_id: 0,
             unclipped_5prime: 1000,
@@ -149,7 +156,7 @@ mod tests {
         buf.insert(make_pending(b"READ_C", 2));
         assert_eq!(buf.peak(), 3);
 
-        let nh = qname_hash(b"READ_A");
+        let nh = qname_hash(b"READ_A", 0);
         let ch = check_hash(b"READ_A");
         buf.remove(nh, ch);
         assert_eq!(buf.len(), 2);

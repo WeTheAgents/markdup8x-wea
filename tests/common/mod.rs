@@ -1,0 +1,363 @@
+//! Shared test infrastructure for markdup-wea integration tests.
+//!
+//! Provides:
+//! - `BamBuilder` — fluent API to construct synthetic coordinate-sorted BAMs
+//! - `read_flags_by_qname` — assertion helper to check FLAG 0x400 on output
+//!
+//! Use pattern:
+//!
+//! ```ignore
+//! mod common;
+//! use common::{BamBuilder, read_flags_by_qname};
+//!
+//! #[test]
+//! fn my_fixture() {
+//!     let tmp = tempfile::tempdir().unwrap();
+//!     let input = tmp.path().join("in.bam");
+//!     let output = tmp.path().join("out.bam");
+//!
+//!     BamBuilder::new()
+//!         .reference("chr1", 100_000)
+//!         .read_group("rg1", "lib1")
+//!         .add_read(ReadSpec { /* ... */ })
+//!         .write(&input).unwrap();
+//!
+//!     markdup_wea::markdup::run(
+//!         input.to_str().unwrap(), Some(output.to_str().unwrap()),
+//!         None, 1, false, None,
+//!     ).unwrap();
+//!
+//!     let flags = read_flags_by_qname(&output);
+//!     assert!(flags["read1"] & 0x400 != 0);
+//! }
+//! ```
+
+#![allow(dead_code)] // helpers used selectively across test files
+
+use bstr::BString;
+use noodles::bam;
+use noodles::core::Position;
+use noodles::sam;
+use noodles::sam::alignment::io::Write as AlignmentWrite;
+use noodles::sam::alignment::record::cigar::op::{Kind, Op};
+use noodles::sam::alignment::record::{Flags, MappingQuality};
+use noodles::sam::alignment::record_buf::{Cigar, QualityScores, Sequence};
+use noodles::sam::alignment::RecordBuf;
+use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
+use noodles::sam::header::record::value::map::read_group::tag::LIBRARY;
+use noodles::sam::header::record::value::map::{self, Map, ReadGroup, ReferenceSequence};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufWriter;
+use std::num::NonZeroUsize;
+use std::path::Path;
+
+// ---------- Read specification ----------
+
+/// Declarative description of one alignment record.
+///
+/// Coordinates are 1-based (SAM convention). `pos` / `mate_pos` of `None` means unmapped.
+#[derive(Clone, Debug)]
+pub struct ReadSpec {
+    pub qname: &'static str,
+    pub flags: u16,
+    pub ref_name: Option<&'static str>,
+    pub pos: Option<usize>,
+    pub mapq: u8,
+    pub cigar: &'static str,
+    pub mate_ref_name: Option<&'static str>,
+    pub mate_pos: Option<usize>,
+    pub tlen: i32,
+    /// Sequence as ASCII bytes (A/C/G/T/N). If empty, defaults to all-'A' of CIGAR query length.
+    pub seq: &'static [u8],
+    /// Per-base Phred qualities. If empty, defaults to Q30 for every base.
+    pub qual: Vec<u8>,
+    /// Optional RG tag value. If set, a matching @RG must have been added to the builder.
+    pub rg: Option<&'static str>,
+}
+
+impl Default for ReadSpec {
+    fn default() -> Self {
+        Self {
+            qname: "read",
+            flags: 0,
+            ref_name: None,
+            pos: None,
+            mapq: 60,
+            cigar: "100M",
+            mate_ref_name: None,
+            mate_pos: None,
+            tlen: 0,
+            seq: b"",
+            qual: Vec::new(),
+            rg: None,
+        }
+    }
+}
+
+// ---------- BAM builder ----------
+
+pub struct BamBuilder {
+    refs: Vec<(String, usize)>,
+    read_groups: Vec<(String, String)>, // (id, library_name)
+    reads: Vec<ReadSpec>,
+    override_sort_order: Option<String>,
+}
+
+impl BamBuilder {
+    pub fn new() -> Self {
+        Self {
+            refs: Vec::new(),
+            read_groups: Vec::new(),
+            reads: Vec::new(),
+            override_sort_order: None,
+        }
+    }
+
+    /// Add a reference sequence (@SQ).
+    pub fn reference(mut self, name: &str, length: usize) -> Self {
+        self.refs.push((name.to_string(), length));
+        self
+    }
+
+    /// Add a read group (@RG) with an associated library (LB).
+    pub fn read_group(mut self, id: &str, library: &str) -> Self {
+        self.read_groups.push((id.to_string(), library.to_string()));
+        self
+    }
+
+    /// Override the @HD SO field (default: "coordinate"). Used for negative tests.
+    pub fn sort_order(mut self, so: &str) -> Self {
+        self.override_sort_order = Some(so.to_string());
+        self
+    }
+
+    /// Add one alignment record.
+    pub fn add_read(mut self, spec: ReadSpec) -> Self {
+        self.reads.push(spec);
+        self
+    }
+
+    /// Add a pair of reads (R1 + R2). Fills cross-mate fields automatically.
+    /// R1 gets FLAG 0x41 (paired + first-in-pair), R2 gets 0x81 (paired + second-in-pair),
+    /// plus any extra flags passed. Caller must still set 0x10/0x20 for reverse orientation.
+    pub fn add_pair(mut self, mut r1: ReadSpec, mut r2: ReadSpec) -> Self {
+        r1.flags |= 0x1 | 0x40; // paired, first-in-pair
+        r2.flags |= 0x1 | 0x80; // paired, second-in-pair
+        // Cross-link mate positions if not already set.
+        if r1.mate_ref_name.is_none() { r1.mate_ref_name = r2.ref_name; }
+        if r1.mate_pos.is_none() { r1.mate_pos = r2.pos; }
+        if r2.mate_ref_name.is_none() { r2.mate_ref_name = r1.ref_name; }
+        if r2.mate_pos.is_none() { r2.mate_pos = r1.pos; }
+        // Mate-reverse flag derived from partner's reverse flag.
+        if r2.flags & 0x10 != 0 { r1.flags |= 0x20; }
+        if r1.flags & 0x10 != 0 { r2.flags |= 0x20; }
+        self.reads.push(r1);
+        self.reads.push(r2);
+        self
+    }
+
+    /// Write the assembled BAM to `path`. Reads are written in the order added;
+    /// caller is responsible for coordinate ordering.
+    pub fn write(self, path: &Path) -> anyhow::Result<()> {
+        let header = self.build_header()?;
+        let ref_name_to_id: HashMap<String, usize> = self
+            .refs
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i))
+            .collect();
+
+        let file = File::create(path)?;
+        // bam::io::Writer::new wraps in BGZF; Writer::from does NOT (important!).
+        let mut writer = bam::io::Writer::new(BufWriter::new(file));
+        writer.write_header(&header)?;
+
+        for spec in &self.reads {
+            let rec = build_record(spec, &ref_name_to_id)?;
+            writer.write_alignment_record(&header, &rec)?;
+        }
+        writer.try_finish()?; // flush BGZF EOF block
+        Ok(())
+    }
+
+    fn build_header(&self) -> anyhow::Result<sam::Header> {
+        use sam::header::record::value::map::header::Version;
+
+        let mut hdr_map = Map::<map::Header>::new(Version::new(1, 6));
+        let so = self.override_sort_order.as_deref().unwrap_or("coordinate");
+        hdr_map
+            .other_fields_mut()
+            .insert(SORT_ORDER, BString::from(so));
+
+        let mut builder = sam::Header::builder().set_header(hdr_map);
+
+        for (name, length) in &self.refs {
+            let len = NonZeroUsize::new(*length)
+                .ok_or_else(|| anyhow::anyhow!("reference length must be > 0"))?;
+            builder = builder.add_reference_sequence(name.clone(), Map::<ReferenceSequence>::new(len));
+        }
+
+        for (id, lib) in &self.read_groups {
+            let mut rg = Map::<ReadGroup>::default();
+            rg.other_fields_mut().insert(LIBRARY, BString::from(lib.as_str()));
+            builder = builder.add_read_group(id.clone(), rg);
+        }
+
+        Ok(builder.build())
+    }
+}
+
+// ---------- Record construction ----------
+
+fn build_record(spec: &ReadSpec, ref_map: &HashMap<String, usize>) -> anyhow::Result<RecordBuf> {
+    let mut b = RecordBuf::builder()
+        .set_name(spec.qname)
+        .set_flags(Flags::from(spec.flags))
+        .set_template_length(spec.tlen);
+
+    if let Some(ref_name) = spec.ref_name {
+        let id = *ref_map
+            .get(ref_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown ref: {}", ref_name))?;
+        b = b.set_reference_sequence_id(id);
+    }
+    if let Some(pos) = spec.pos {
+        b = b.set_alignment_start(Position::try_from(pos)?);
+    }
+    if let Some(mref) = spec.mate_ref_name {
+        let id = *ref_map
+            .get(mref)
+            .ok_or_else(|| anyhow::anyhow!("unknown mate ref: {}", mref))?;
+        b = b.set_mate_reference_sequence_id(id);
+    }
+    if let Some(mpos) = spec.mate_pos {
+        b = b.set_mate_alignment_start(Position::try_from(mpos)?);
+    }
+    if let Some(mq) = MappingQuality::new(spec.mapq) {
+        b = b.set_mapping_quality(mq);
+    }
+
+    let cigar = parse_cigar(spec.cigar)?;
+    let query_len = cigar_query_len(&cigar);
+    b = b.set_cigar(cigar);
+
+    let seq: Vec<u8> = if spec.seq.is_empty() {
+        vec![b'A'; query_len]
+    } else {
+        spec.seq.to_vec()
+    };
+    b = b.set_sequence(Sequence::from(seq));
+
+    let qual: Vec<u8> = if spec.qual.is_empty() {
+        vec![30; query_len]
+    } else {
+        spec.qual.clone()
+    };
+    b = b.set_quality_scores(QualityScores::from(qual));
+
+    if let Some(rg) = spec.rg {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        use noodles::sam::alignment::record_buf::Data;
+        let data: Data = [(Tag::READ_GROUP, Value::String(BString::from(rg)))]
+            .into_iter()
+            .collect();
+        b = b.set_data(data);
+    }
+
+    Ok(b.build())
+}
+
+fn parse_cigar(s: &str) -> anyhow::Result<Cigar> {
+    let mut ops: Vec<Op> = Vec::new();
+    let mut num = 0usize;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num = num * 10 + (c as usize - '0' as usize);
+        } else {
+            let kind = match c {
+                'M' => Kind::Match,
+                'I' => Kind::Insertion,
+                'D' => Kind::Deletion,
+                'N' => Kind::Skip,
+                'S' => Kind::SoftClip,
+                'H' => Kind::HardClip,
+                'P' => Kind::Pad,
+                '=' => Kind::SequenceMatch,
+                'X' => Kind::SequenceMismatch,
+                other => anyhow::bail!("unknown CIGAR op: {}", other),
+            };
+            ops.push(Op::new(kind, num));
+            num = 0;
+        }
+    }
+    Ok(ops.into_iter().collect())
+}
+
+/// Number of query bases consumed by the CIGAR (for SEQ/QUAL length).
+fn cigar_query_len(cigar: &Cigar) -> usize {
+    cigar
+        .as_ref()
+        .iter()
+        .filter(|op| matches!(
+            op.kind(),
+            Kind::Match | Kind::Insertion | Kind::SoftClip
+                | Kind::SequenceMatch | Kind::SequenceMismatch
+        ))
+        .map(|op| op.len())
+        .sum()
+}
+
+// ---------- Output inspection ----------
+
+/// Read an output BAM and return a map from QNAME → FLAG for the FIRST occurrence
+/// of each QNAME. For paired-end fixtures, prefer `read_flags_by_qname_all`.
+pub fn read_flags_by_qname(path: &Path) -> HashMap<String, u16> {
+    let mut map = HashMap::new();
+    let file = File::open(path).expect("open output BAM");
+    let mut reader = bam::io::Reader::new(file);
+    let _header = reader.read_header().expect("read header");
+    let mut rec = bam::Record::default();
+    while reader.read_record(&mut rec).expect("read record") > 0 {
+        let name = rec.name().map(|n| {
+            let b: &[u8] = n.as_ref();
+            String::from_utf8_lossy(b).to_string()
+        });
+        if let Some(n) = name {
+            map.entry(n).or_insert_with(|| u16::from(rec.flags()));
+        }
+    }
+    map
+}
+
+/// Read all occurrences of each QNAME (R1 + R2 + supplementary etc.).
+pub fn read_flags_by_qname_all(path: &Path) -> HashMap<String, Vec<u16>> {
+    let mut map: HashMap<String, Vec<u16>> = HashMap::new();
+    let file = File::open(path).expect("open output BAM");
+    let mut reader = bam::io::Reader::new(file);
+    let _header = reader.read_header().expect("read header");
+    let mut rec = bam::Record::default();
+    while reader.read_record(&mut rec).expect("read record") > 0 {
+        let name = rec.name().map(|n| {
+            let b: &[u8] = n.as_ref();
+            String::from_utf8_lossy(b).to_string()
+        });
+        if let Some(n) = name {
+            map.entry(n).or_default().push(u16::from(rec.flags()));
+        }
+    }
+    map
+}
+
+/// Convenience: run markdup-wea on `input`, write output to `output`.
+pub fn run_markdup(input: &Path, output: &Path) -> anyhow::Result<()> {
+    markdup_wea::markdup::run(
+        input.to_str().unwrap(),
+        Some(output.to_str().unwrap()),
+        None,
+        1,
+        false,
+        None,
+    )
+}
