@@ -8,17 +8,24 @@ use noodles::sam;
 use noodles::sam::header::record::value::map::header::tag::SORT_ORDER;
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use tempfile::NamedTempFile;
 
-/// The concrete BAM reader type (over bgzf-wrapped File).
-pub type BamReader = bam::io::Reader<bgzf::Reader<File>>;
-/// The concrete BAM writer type.
-pub type BamWriter<W> = bam::io::Writer<bgzf::Writer<W>>;
+/// The concrete BAM reader type (over a multithreaded-bgzf-wrapped File).
+/// `MultithreadedReader` with worker_count=1 behaves like the plain reader,
+/// so this type alias works for both single- and multi-threaded I/O.
+pub type BamReader = bam::io::Reader<bgzf::MultithreadedReader<File>>;
+/// The concrete BAM writer type (multithreaded BGZF wrapping inner W).
+pub type BamWriter<W> = bam::io::Writer<bgzf::MultithreadedWriter<W>>;
 
-/// Open a BAM reader from a file path.
-pub fn open_bam(path: &str) -> Result<(BamReader, sam::Header)> {
+/// Open a BAM reader from a file path with `threads` BGZF decode workers
+/// (clamped to ≥1). Worker threads run BGZF decompression in the background;
+/// the scan loop itself remains sequential by algorithm design.
+pub fn open_bam(path: &str, threads: usize) -> Result<(BamReader, sam::Header)> {
     let file = File::open(path).with_context(|| format!("Failed to open BAM: {}", path))?;
-    let mut reader = bam::io::Reader::new(file);
+    let workers = NonZeroUsize::new(threads.max(1)).unwrap();
+    let bgzf_reader = bgzf::MultithreadedReader::with_worker_count(workers, file);
+    let mut reader = bam::io::Reader::from(bgzf_reader);
     let header = reader.read_header().context("Failed to read BAM header")?;
     Ok((reader, header))
 }

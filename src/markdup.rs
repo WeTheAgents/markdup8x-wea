@@ -7,22 +7,25 @@ use crate::scan;
 use anyhow::{Context, Result};
 use log::info;
 use noodles::bam;
+use noodles::bgzf;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::Flags;
 use noodles::sam::alignment::RecordBuf;
+use std::num::NonZeroUsize;
 
 pub fn run(
     input: &str,
     output: Option<&str>,
     metrics_path: Option<&str>,
-    _threads: u32,
+    threads: u32,
     remove_duplicates: bool,
     assume_sort_order: Option<&str>,
 ) -> Result<()> {
     let (actual_path, _tmp) = io::resolve_input(input)?;
+    let n_threads = (threads as usize).max(1);
 
     // === Pass 1 ===
-    let (mut reader, header) = io::open_bam(&actual_path)?;
+    let (mut reader, header) = io::open_bam(&actual_path, n_threads)?;
     io::validate_sort_order(&header, assume_sort_order)?;
 
     info!("Pass 1: scanning for duplicates...");
@@ -42,18 +45,23 @@ pub fn run(
 
     // === Pass 2: read records, convert to RecordBuf, modify flags, write ===
     info!("Pass 2: writing output...");
-    let (mut reader2, header2) = io::open_bam(&actual_path)?;
+    let (mut reader2, header2) = io::open_bam(&actual_path, n_threads)?;
 
-    // Write to file or stdout. bam::io::Writer::new() wraps the underlying writer in BGZF;
-    // Writer::from() does NOT — must use ::new() to produce a valid BAM file.
-    let mut writer: bam::io::Writer<noodles::bgzf::io::Writer<Box<dyn std::io::Write>>> =
-        if let Some(p) = output {
-            let f = std::fs::File::create(p).with_context(|| format!("Failed to create: {}", p))?;
-            bam::io::Writer::new(Box::new(std::io::BufWriter::new(f)) as Box<dyn std::io::Write>)
-        } else {
-            let stdout = std::io::stdout().lock();
-            bam::io::Writer::new(Box::new(std::io::BufWriter::new(stdout)) as Box<dyn std::io::Write>)
-        };
+    // Pass-2 writer wraps the destination in MultithreadedWriter for parallel
+    // BGZF compression. We then construct bam::io::Writer::from(bgzf_writer)
+    // — `from` accepts a pre-wrapped inner writer (vs `new` which would wrap
+    // a second time in single-threaded BGZF).
+    let workers = NonZeroUsize::new(n_threads).unwrap();
+    type BoxedRaw = Box<dyn std::io::Write + Send + 'static>;
+    let raw: BoxedRaw = if let Some(p) = output {
+        let f = std::fs::File::create(p).with_context(|| format!("Failed to create: {}", p))?;
+        Box::new(std::io::BufWriter::new(f))
+    } else {
+        Box::new(std::io::BufWriter::new(std::io::stdout()))
+    };
+    let bgzf_w = bgzf::MultithreadedWriter::with_worker_count(workers, raw);
+    let mut writer: bam::io::Writer<bgzf::MultithreadedWriter<BoxedRaw>> =
+        bam::io::Writer::from(bgzf_w);
 
     writer.write_header(&header2)?;
 
@@ -85,7 +93,10 @@ pub fn run(
         record_id += 1;
     }
 
-    writer.try_finish()?;
+    // MultithreadedWriter::finish flushes pending blocks, joins worker threads,
+    // and writes the BGZF EOF marker. Single-threaded bgzf::Writer used `try_finish`;
+    // the multithreaded variant exposes `finish` returning the inner W.
+    writer.get_mut().finish()?;
 
     info!(
         "Pass 2 done: {} written, {} flagged{}",
