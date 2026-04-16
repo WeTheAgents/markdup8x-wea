@@ -136,13 +136,21 @@ pub fn write_metrics(
     // Picard writes an empty field (no value after the TAB) when the estimate is null.
     let est_str = est_opt.map(|v| v.to_string()).unwrap_or_default();
 
-    // Header
+    // Picard preamble has two `## htsjdk.samtools.metrics.StringHeader` blocks
+    // separated by a `# ...` comment line each:
+    //   block 1 → command line (provenance of the producing tool)
+    //   block 2 → run start timestamp ("Started on: <Picard date format>")
+    // We emit the same shape for MultiQC and downstream-parser parity. Content
+    // is honest: tool identifier is markdup-wea (we don't pretend to be
+    // MarkDuplicates), and the timestamp reflects our actual run start.
     writeln!(f, "## htsjdk.samtools.metrics.StringHeader")?;
     writeln!(
         f,
         "# markdup-wea {} INPUT={} OUTPUT={}",
         version, input_path, output_path
     )?;
+    writeln!(f, "## htsjdk.samtools.metrics.StringHeader")?;
+    writeln!(f, "# Started on: {}", started_on_picard_format())?;
 
     // Metrics class line (TAB-separated — critical for MultiQC).
     // Picard v3.x (verified on real nf-core/rnaseq output) writes
@@ -211,6 +219,15 @@ pub fn write_metrics(
     }
 
     Ok(())
+}
+
+/// Picard's date format: e.g. "Wed Apr 08 04:31:00 GMT 2026". Locale-independent
+/// (always English short names + UTC, displayed as "GMT" to match Picard exactly).
+fn started_on_picard_format() -> String {
+    let now = jiff::Zoned::now().with_time_zone(jiff::tz::TimeZone::UTC);
+    // strftime: %a abbrev weekday, %b abbrev month, %d zero-padded day,
+    //           %H:%M:%S 24h time, then literal " GMT ", %Y 4-digit year.
+    now.strftime("%a %b %d %H:%M:%S GMT %Y").to_string()
 }
 
 /// Format a float the way Picard's `FormatUtil`/`DecimalFormat("0.######")` does:
@@ -340,6 +357,25 @@ mod tests {
 
         // Check critical MultiQC header
         assert!(content.contains("## METRICS CLASS\tpicard.sam.DuplicationMetrics"));
+        // Picard preamble structural parity: TWO StringHeader sections
+        let n_headers = content.matches("## htsjdk.samtools.metrics.StringHeader").count();
+        assert_eq!(n_headers, 2, "expected 2 StringHeader sections (Picard parity), got {}", n_headers);
+        // Block 1: command-line provenance (we identify ourselves honestly)
+        assert!(content.contains("# markdup-wea "));
+        // Block 2: "Started on" timestamp in Picard format ("EEE MMM dd HH:MM:SS GMT YYYY")
+        let started_line = content
+            .lines()
+            .find(|l| l.starts_with("# Started on: "))
+            .expect("missing '# Started on:' line");
+        let parts: Vec<&str> = started_line["# Started on: ".len()..].split_whitespace().collect();
+        // Expected fields: [weekday, month, day, "HH:MM:SS", "GMT", year]
+        assert_eq!(parts.len(), 6, "Picard date should have 6 space-separated tokens, got {:?}", parts);
+        assert_eq!(parts[0].len(), 3, "weekday should be 3-char abbrev, got {:?}", parts[0]);
+        assert_eq!(parts[1].len(), 3, "month should be 3-char abbrev, got {:?}", parts[1]);
+        assert_eq!(parts[2].len(), 2, "day should be 2-char zero-padded, got {:?}", parts[2]);
+        assert_eq!(parts[3].len(), 8, "time should be HH:MM:SS, got {:?}", parts[3]);
+        assert_eq!(parts[4], "GMT", "expected literal GMT zone, got {:?}", parts[4]);
+        assert_eq!(parts[5].len(), 4, "year should be 4 digits, got {:?}", parts[5]);
         // Check column headers
         assert!(content.contains("LIBRARY\tUNPAIRED_READS_EXAMINED"));
         // Check 4-column Picard histogram format
