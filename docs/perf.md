@@ -86,6 +86,51 @@ These numbers used the synchronous reader/writer (pre-D1). With the new
 default (`-@ 1` ≈ 1.7×), full-batch wall would drop to roughly
 **1:25 hours** (vs Picard's 4:05 hours).
 
+## Phase D — full-batch with `-@ 4` (post-threading)
+
+Re-run of all 8 samples on the new binary (commit `31399f9`, with D1+D2+D4
+landed) using `-@ 4` and `-o /dev/null` (metrics only — output BAM not
+needed for this benchmark).
+
+| Sample        | Input | Old wall | -@ 4 wall | Speedup |
+|---------------|------:|---------:|----------:|--------:|
+| K562_REP1     |  8.7G | 16:47    |  7:47     | 2.16×   |
+| GM12878_REP1  |  9.0G | 18:09    |  8:29     | 2.14×   |
+| GM12878_REP2  |  9.1G | 18:24    |  8:35     | 2.14×   |
+| H1_REP1       |  12G  | 22:47    | 10:54     | 2.09×   |
+| H1_REP2       |  9.2G | 18:60    |  8:53     | 2.13×   |
+| K562_REP2     |  12G  | 21:13    | 10:36     | 2.00×   |
+| MCF7_REP1     |  13G  | 22:48    | 10:46     | 2.12×   |
+| MCF7_REP2     |  12G  | 23:30    | 10:52     | 2.16×   |
+| **Mean**      |  —    | **20:20**| **9:36**  | **2.12×** |
+
+Per-sample speedup is remarkably consistent (2.00–2.16×) across input
+sizes from 8.7 G to 13 G — the BGZF I/O parallelism delivers the same
+factor regardless of file size, confirming the bottleneck shifts to the
+sequential scan loop equally for each sample.
+
+**Full-batch totals**
+
+| Tool                    | 8-sample wall | vs Picard |
+|-------------------------|--------------:|----------:|
+| Picard 3.4.0 (Java)     | **4:05 h**    | 1.0×      |
+| markdup-wea (single)    | 2:43 h        | 1.50×     |
+| markdup-wea (`-@ 4`)    | **1:17 h**    | **3.18×** |
+
+## Phase D — MultiQC parity
+
+All 8 sample-pairs (16 metrics files) parsed by MultiQC 1.33 with no
+warnings; the `multiqc_picard_dups` table shows byte-identical values
+across all ten columns for every (`*_wea`, `*_picard`) pair:
+
+* `LIBRARY` = `Unknown Library` (D4 fallback matches Picard).
+* `READ_PAIRS_EXAMINED`, `READ_PAIR_DUPLICATES`, `PERCENT_DUPLICATION`,
+  `ESTIMATED_LIBRARY_SIZE` — exact match (D2 trimmed-float formatting
+  matches Picard's `DecimalFormat("0.######")` precision).
+* `READ_PAIR_OPTICAL_DUPLICATES = 0` — both (we don't compute optical;
+  documented as Deviation #1).
+
+
 ## How to reproduce
 
 The numbers in this document came from `/root/markdup-test/threading_bench.sh`
