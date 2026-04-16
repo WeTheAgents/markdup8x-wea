@@ -10,6 +10,9 @@ pub trait DupSet {
     fn insert(&mut self, record_id: u64);
     fn contains(&self, record_id: u64) -> bool;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// BitVec-backed dupset: 1 bit per record, O(1) lookup, ~25MB for 200M reads.
@@ -30,6 +33,12 @@ impl BitVecDupSet {
         let mut bits = BitVec::with_capacity(n);
         bits.resize(n, false);
         Self { bits, count: 0 }
+    }
+}
+
+impl Default for BitVecDupSet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -65,6 +74,12 @@ impl HashDupSet {
         Self {
             set: FxHashSet::default(),
         }
+    }
+}
+
+impl Default for HashDupSet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

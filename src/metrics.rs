@@ -41,6 +41,12 @@ impl MetricsCounters {
     }
 }
 
+impl Default for MetricsCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Compute PERCENT_DUPLICATION per Picard formula.
 pub fn percent_duplication(counters: &MetricsCounters) -> f64 {
     let numerator =

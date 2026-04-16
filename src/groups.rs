@@ -173,6 +173,12 @@ impl PairedGroupTracker {
     }
 }
 
+impl Default for PairedGroupTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Inline single-end group tracker. Resolves consecutive groups immediately.
 pub struct SingleEndTracker {
     current_key: Option<SingleEndKey>,
@@ -273,6 +279,12 @@ impl SingleEndTracker {
         }
 
         self.current_group.clear();
+    }
+}
+
+impl Default for SingleEndTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -13,8 +13,8 @@
 mod common;
 
 use common::{
-    dup_qnames_set, pair_count_by_qname, parse_metrics, run_markdup, run_markdup_with_metrics,
-    BamBuilder, ReadSpec,
+    dup_qnames_set, pair_count_by_qname, parse_metrics, read_flags_by_qname_all,
+    read_string_tag_by_qname, run_markdup, run_markdup_with_metrics, BamBuilder, ReadSpec,
 };
 use tempfile::tempdir;
 
@@ -1085,5 +1085,125 @@ fn b13_zero_pairs_metric_produces_valid_file() {
     assert_eq!(
         recs[0].estimated_library_size, None,
         "A7: undefined estimate serializes as empty field"
+    );
+}
+
+// =============================================================================
+// B14 — Output-side fidelity: pre-existing duplicate flags are cleared/recomputed
+// =============================================================================
+//
+// One unique single-end read arrives already marked duplicate (0x400). Picard
+// clears stale duplicate flags and recomputes from scratch; the output must
+// therefore NOT retain 0x400.
+#[test]
+fn b14_stale_duplicate_flag_is_cleared() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(ReadSpec {
+            qname: "stale",
+            flags: 0x400,
+            ref_name: Some("chr1"),
+            pos: Some(100),
+            cigar: "100M",
+            ..Default::default()
+        })
+        .write(&input)
+        .unwrap();
+
+    run_markdup(&input, &output).unwrap();
+
+    let flags = read_flags_by_qname_all(&output);
+    assert_eq!(flags["stale"].len(), 1);
+    assert_eq!(
+        flags["stale"][0] & 0x400,
+        0,
+        "stale input duplicate bit must be cleared when the record is not a duplicate"
+    );
+}
+
+// =============================================================================
+// B15 — Output-side fidelity: CLEAR_DT strips stale DT tags before writing
+// =============================================================================
+//
+// Picard defaults CLEAR_DT=true. A pre-existing DT:Z:LB tag on input must not
+// survive to output when we are not explicitly re-tagging duplicates.
+#[test]
+fn b15_stale_dt_tag_is_cleared() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(ReadSpec {
+            qname: "dt",
+            ref_name: Some("chr1"),
+            pos: Some(100),
+            cigar: "100M",
+            dt: Some("LB"),
+            ..Default::default()
+        })
+        .write(&input)
+        .unwrap();
+
+    run_markdup(&input, &output).unwrap();
+
+    let tags = read_string_tag_by_qname(&output, *b"DT");
+    assert_eq!(tags["dt"], vec![None], "stale DT tag must be removed from output");
+}
+
+// =============================================================================
+// B16 — Failure mode fidelity: chromosome regressions must hard-fail
+// =============================================================================
+//
+// coordinate sort means references are globally nondecreasing. A stream
+// chr1 -> chr2 -> chr1 must error rather than quietly flushing the earlier chr1
+// duplicate groups and continuing with a wrong answer.
+#[test]
+fn b16_chromosome_regression_hard_fails() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .reference("chr2", 100_000)
+        .read_group("rg1", "lib1")
+        .add_read(ReadSpec {
+            qname: "a",
+            ref_name: Some("chr1"),
+            pos: Some(100),
+            cigar: "100M",
+            ..Default::default()
+        })
+        .add_read(ReadSpec {
+            qname: "b",
+            ref_name: Some("chr2"),
+            pos: Some(100),
+            cigar: "100M",
+            ..Default::default()
+        })
+        .add_read(ReadSpec {
+            qname: "c",
+            ref_name: Some("chr1"),
+            pos: Some(200),
+            cigar: "100M",
+            ..Default::default()
+        })
+        .write(&input)
+        .unwrap();
+
+    let err = run_markdup(&input, &output).expect_err("cross-chromosome regression must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Sort order violation") || msg.contains("Not coordinate-sorted"),
+        "expected coordinate-sort failure, got: {}",
+        msg
     );
 }

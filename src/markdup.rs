@@ -4,14 +4,24 @@ use crate::dupset::DupSet;
 use crate::io;
 use crate::metrics;
 use crate::scan;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::info;
 use noodles::bam;
 use noodles::bgzf;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
-use noodles::sam::alignment::record::Flags;
+use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::RecordBuf;
+use std::path::{Path, PathBuf};
 use std::num::NonZeroUsize;
+
+fn normalized_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
 
 pub fn run(
     input: &str,
@@ -23,6 +33,12 @@ pub fn run(
 ) -> Result<()> {
     let (actual_path, _tmp) = io::resolve_input(input)?;
     let n_threads = (threads as usize).max(1);
+
+    if let Some(output_path) = output {
+        if normalized_path(output_path)? == normalized_path(&actual_path)? {
+            bail!("Output path must differ from input path to avoid truncating the source BAM");
+        }
+    }
 
     // === Pass 1 ===
     let (mut reader, header) = io::open_bam(&actual_path, n_threads)?;
@@ -75,6 +91,7 @@ pub fn run(
 
         // Convert to RecordBuf to modify flags
         let mut rec_buf = RecordBuf::try_from_alignment_record(&header2, &record)?;
+        rec_buf.data_mut().remove(&Tag::new(b'D', b'T'));
 
         let current_flags = u16::from(rec_buf.flags());
         let new_flags = if is_dup {

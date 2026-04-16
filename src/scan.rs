@@ -13,7 +13,6 @@ use anyhow::{bail, Context, Result};
 use log::{info, warn};
 use noodles::bam;
 use noodles::sam;
-use noodles::sam::alignment::record::Flags;
 use noodles::sam::header::record::value::map::read_group::tag::LIBRARY;
 use rustc_hash::FxHashMap;
 
@@ -122,6 +121,37 @@ fn extract_quals(record: &bam::Record) -> Vec<u8> {
     bytes.to_vec()
 }
 
+fn extract_reference_sequence_id(record: &bam::Record) -> Result<Option<usize>> {
+    record
+        .reference_sequence_id()
+        .transpose()
+        .context("Failed to decode reference sequence ID")
+}
+
+fn extract_alignment_start(record: &bam::Record) -> Result<Option<i64>> {
+    record
+        .alignment_start()
+        .transpose()
+        .context("Failed to decode alignment start")
+        .map(|pos| pos.map(|p| (usize::from(p) as i64) - 1))
+}
+
+fn extract_mate_reference_sequence_id(record: &bam::Record) -> Result<Option<i32>> {
+    record
+        .mate_reference_sequence_id()
+        .transpose()
+        .context("Failed to decode mate reference sequence ID")
+        .map(|tid| tid.map(|t| t as i32))
+}
+
+fn extract_mate_alignment_start(record: &bam::Record) -> Result<Option<i64>> {
+    record
+        .mate_alignment_start()
+        .transpose()
+        .context("Failed to decode mate alignment start")
+        .map(|pos| pos.map(|p| (usize::from(p) as i64) - 1))
+}
+
 /// Run Pass 1.
 pub fn scan_pass(
     reader: &mut crate::io::BamReader,
@@ -143,14 +173,8 @@ pub fn scan_pass(
 
     while reader.read_record(&mut record)? > 0 {
         let flags = record.flags();
-        let tid = record.reference_sequence_id().transpose().ok().flatten();
-        let pos = record
-            .alignment_start()
-            .transpose()
-            .ok()
-            .flatten()
-            .map(|p| (usize::from(p) as i64) - 1)
-            .unwrap_or(-1);
+        let tid = extract_reference_sequence_id(&record)?;
+        let pos = extract_alignment_start(&record)?.unwrap_or(-1);
 
         enforcer.check(tid, pos).context("Sort order violation")?;
 
@@ -212,20 +236,8 @@ pub fn scan_pass(
                 .unwrap_or(b"");
             let nh = qname_hash(qname_bytes, read_group.as_deref());
             let ch = check_hash(qname_bytes, read_group.as_deref());
-            let mate_tid = record
-                .mate_reference_sequence_id()
-                .transpose()
-                .ok()
-                .flatten()
-                .map(|t| t as i32)
-                .unwrap_or(-1);
-            let mate_pos = record
-                .mate_alignment_start()
-                .transpose()
-                .ok()
-                .flatten()
-                .map(|p| (usize::from(p) as i64) - 1)
-                .unwrap_or(-1);
+            let mate_tid = extract_mate_reference_sequence_id(&record)?.unwrap_or(-1);
+            let mate_pos = extract_mate_alignment_start(&record)?.unwrap_or(-1);
 
             // Insert a fragment-group marker at this read's single-end key.
             // Picard (§4 of research): paired reads always beat fragments at
