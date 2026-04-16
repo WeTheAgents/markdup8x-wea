@@ -618,14 +618,17 @@ fn b08_multiple_rg_same_lb_same_library() {
 }
 
 // =============================================================================
-// B9 — A3 fallback: two RGs with NO LB tag → library falls back to RG ID
+// B9 — A3 fallback: two RGs with NO LB tag → both collapse to "Unknown Library"
 // =============================================================================
 //
-// Two @RG entries without LB. Scanner's A3 fallback (src/scan.rs:26-36)
-// assigns a library per RG ID, so the two RGs form DIFFERENT library
-// buckets. Two identical pairs, one per RG, must NOT group → zero duplicates.
+// Two @RG entries without LB. Verifies that scanner's library fallback
+// (src/scan.rs::build_library_map) matches Picard's
+// `LibraryIdGenerator.getLibraryName` exactly — when LB is absent the library
+// name resolves to the literal "Unknown Library", NOT the @RG ID. Both RGs
+// therefore share a single library bucket, and two identical pairs (one per
+// RG) collapse into one duplicate group → exactly 1 pair flagged.
 #[test]
-fn b09_missing_lb_fallback_to_id() {
+fn b09_missing_lb_fallback_unknown_library() {
     let dir = tempdir().unwrap();
     let input = dir.path().join("in.bam");
     let output = dir.path().join("out.bam");
@@ -686,14 +689,18 @@ fn b09_missing_lb_fallback_to_id() {
     run_markdup_with_metrics(&input, &output, &metrics).unwrap();
 
     let dups = dup_qnames_set(&output);
-    assert!(
-        dups.is_empty(),
-        "RGs without LB must fall back to distinct library ids → no grouping, got {:?}",
+    assert_eq!(
+        dups.len(),
+        1,
+        "RGs without LB must collapse to single \"Unknown Library\" bucket → \
+         exactly 1 pair flagged, got {:?}",
         dups
     );
+    assert!(dups.contains("pA") || dups.contains("pB"));
 
     let recs = parse_metrics(&metrics).unwrap();
-    assert_eq!(recs[0].read_pair_duplicates, 0);
+    assert_eq!(recs[0].read_pair_duplicates, 1);
+    assert_eq!(recs[0].library, "Unknown Library");
     // Sanity: no pair lost.
     let counts = pair_count_by_qname(&output);
     assert_eq!(counts["pA"], 2);

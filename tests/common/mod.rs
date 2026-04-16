@@ -126,9 +126,11 @@ impl BamBuilder {
         self
     }
 
-    /// Add a read group (@RG) **without an LB tag** — used to test the A3
-    /// fallback where the library name defaults to the @RG ID. Encoded here
-    /// as a sentinel empty string which build_header skips when emitting LB.
+    /// Add a read group (@RG) **without an LB tag** — used to test the
+    /// Picard-exact LB fallback where the library name defaults to the literal
+    /// string "Unknown Library" (NOT the @RG ID, despite older docs that
+    /// claimed otherwise — verified against Picard 3.4.0 source). Encoded here
+    /// as a sentinel empty LB string which `build_header` skips when emitting LB.
     pub fn read_group_no_lb(mut self, id: &str) -> Self {
         self.read_groups.push((id.to_string(), String::new()));
         self

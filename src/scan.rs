@@ -25,17 +25,18 @@ fn build_library_map(header: &sam::Header) -> (FxHashMap<Vec<u8>, u8>, Vec<Strin
     let mut rg_to_lib: FxHashMap<Vec<u8>, u8> = FxHashMap::default();
 
     for (id, rg) in header.read_groups().iter() {
-        // Picard library fallback (research §6): LB → RG ID → error.
-        // If LB tag is absent, use the @RG ID as the library name so reads from
-        // that RG form a distinct group, matching Picard's LibraryIdGenerator.
+        // Picard library fallback (verified in real Picard 3.4.0 source —
+        // `picard.sam.markduplicates.util.LibraryIdGenerator.getLibraryName`):
+        // when @RG LB tag is absent, the library name falls back to the literal
+        // string "Unknown Library", NOT the @RG ID. All reads with missing LB
+        // therefore collapse into a single library bucket. Confirmed by real-data
+        // diff against Picard on 8 ENCODE samples (Phase C).
+        let _ = id; // @RG ID is unused for library naming; kept for diagnostics if needed.
         let lib_name = rg
             .other_fields()
             .get(&LIBRARY)
             .map(|v| String::from_utf8_lossy(v.as_ref()).to_string())
-            .unwrap_or_else(|| {
-                let id_bytes: &[u8] = id.as_ref();
-                String::from_utf8_lossy(id_bytes).to_string()
-            });
+            .unwrap_or_else(|| "Unknown Library".to_string());
 
         let lib_idx = if let Some(idx) = lib_names.iter().position(|n| n == &lib_name) {
             idx as u8

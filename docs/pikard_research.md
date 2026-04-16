@@ -122,11 +122,19 @@ boolean isDuplicate = recordIndex == nextDuplicateIndex ||
 
 ## 6. Library detection and the @RG fallback chain
 
-Library assignment follows a strict fallback:
+**Correction (Phase D, 2026-04-16):** the original write-up below incorrectly
+described step 2 as falling back to the @RG ID. Verified against Picard 3.4.0
+source (`picard.sam.markduplicates.util.LibraryIdGenerator.getLibraryName`)
+and against real-data byte-diff on 8 ENCODE samples (Phase C):
 
 1. Read's `RG` tag → look up `@RG` header record → use `LB` field
-2. If `LB` is missing: fall back to the **read group ID** (`ID` field from `@RG`)
-3. If the read has **no RG tag at all**: in theory returns a constant "unknown library" string, but in practice **throws NullPointerException** at `buildSortedReadEndLists` (confirmed by GATK community reports)
+2. If `LB` is missing: fall back to the literal string **"Unknown Library"**
+   (NOT the @RG ID). All reads with absent LB therefore collapse into a
+   single library bucket — which means duplicates ARE detected across @RG
+   entries that all lack LB.
+3. If the read has **no RG tag at all**: in theory returns a constant
+   "unknown library" string, but in practice **throws NullPointerException**
+   at `buildSortedReadEndLists` (confirmed by GATK community reports).
 
 Multiple `@RG` lines sharing the same `LB` value receive the **same `libraryId` (short)**, meaning reads from different read groups with the same library are potential duplicates of each other. Library ID is the **first field checked** in `areComparableForDuplicates` — reads from different libraries are never compared.
 
