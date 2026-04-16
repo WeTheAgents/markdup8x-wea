@@ -9,7 +9,7 @@ use crate::metrics::MetricsCounters;
 use crate::pending_mates::{check_hash, qname_hash, PendingMate, PendingMateBuffer};
 use crate::position::unclipped_5prime;
 use crate::scoring::quality_sum;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::{info, warn};
 use noodles::bam;
 use noodles::sam;
@@ -65,21 +65,36 @@ fn metrics_library_name(header: &sam::Header) -> String {
     "Unknown Library".to_string()
 }
 
-fn get_library_idx(record: &bam::Record, rg_to_lib: &FxHashMap<Vec<u8>, u8>) -> u8 {
+fn get_library_idx(read_group: Option<&[u8]>, rg_to_lib: &FxHashMap<Vec<u8>, u8>) -> u8 {
     if rg_to_lib.is_empty() {
         return 0;
     }
-    use noodles::sam::alignment::record::data::field::Tag;
-    if let Some(Ok(value)) = record.data().get(&Tag::READ_GROUP) {
-        use noodles::sam::alignment::record::data::field::Value;
-        if let Value::String(s) = value {
-            let s_bytes: &[u8] = s.as_ref();
-            if let Some(&idx) = rg_to_lib.get(s_bytes) {
-                return idx;
-            }
+    if let Some(read_group) = read_group {
+        if let Some(&idx) = rg_to_lib.get(read_group) {
+            return idx;
         }
     }
     0
+}
+
+fn extract_read_group(record: &bam::Record) -> Result<Option<Vec<u8>>> {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record::data::field::Value;
+
+    let data = record.data();
+    let value = data
+        .get(&Tag::READ_GROUP)
+        .transpose()
+        .context("Failed to decode RG tag")?;
+
+    match value {
+        Some(Value::String(s)) => {
+            let bytes: &[u8] = s.as_ref();
+            Ok(Some(bytes.to_vec()))
+        }
+        Some(_) => bail!("RG tag must be a string"),
+        None => Ok(None),
+    }
 }
 
 pub struct ScanResult {
@@ -172,7 +187,8 @@ pub fn scan_pass(
         let uc5 = unclipped_5prime(pos, &cigar_ops, is_reverse);
         let quals = extract_quals(&record);
         let qsum = quality_sum(&quals);
-        let lib_idx = get_library_idx(&record, &rg_to_lib);
+        let read_group = extract_read_group(&record)?;
+        let lib_idx = get_library_idx(read_group.as_deref(), &rg_to_lib);
         let tid_i32 = tid.map(|t| t as i32).unwrap_or(-1);
 
         if !is_paired || mate_unmapped {
@@ -194,8 +210,8 @@ pub fn scan_pass(
                     b
                 })
                 .unwrap_or(b"");
-            let nh = qname_hash(qname_bytes, lib_idx);
-            let ch = check_hash(qname_bytes);
+            let nh = qname_hash(qname_bytes, read_group.as_deref());
+            let ch = check_hash(qname_bytes, read_group.as_deref());
             let mate_tid = record
                 .mate_reference_sequence_id()
                 .transpose()

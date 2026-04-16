@@ -771,8 +771,8 @@ fn b10_mq_zero_chimeric_pair() {
 //
 // Two reads in different RGs with the IDENTICAL QNAME "shared", at DIFFERENT
 // positions. The A4 fix (src/pending_mates.rs:23-36) keys pending-mate
-// lookup by (library_idx, qname_hash), so the two same-named pairs do not
-// collide in the pending buffer and both pairs resolve correctly.
+// lookup by (RG, QNAME), so the two same-named pairs do not collide in the
+// pending buffer and both pairs resolve correctly.
 //
 // Assertion: no duplicates (positions differ) AND all 4 records are in
 // output (pair_count_by_qname["shared"] == 4). If A4 is broken, one pair's
@@ -856,6 +856,122 @@ fn b11_cross_rg_same_qname_not_matched() {
     let recs = parse_metrics(&metrics).unwrap();
     assert_eq!(recs[0].read_pair_duplicates, 0);
     assert_eq!(recs[0].read_pairs_examined, 2);
+}
+
+// =============================================================================
+// B11b — A4: cross-RG same-QNAME isolation still holds when LB is shared
+// =============================================================================
+//
+// This is the bug-shaped case: rg1 and rg2 share the same LB, so dedup grouping
+// is intentionally shared, but mate lookup must still stay isolated per RG.
+//
+// Construction:
+// - Two pairs named "shared" live in different RGs but the SAME library.
+// - Their R1s arrive first (chr1:100 and chr1:200).
+// - The rg2 R2 arrives before the rg1 R2, so a buggy lookup keyed only by
+//   library+QNAME will match it to the wrong pending mate.
+// - A third control pair lives at the exact mixed key that the buggy cross-pair
+//   would synthesize.
+//
+// Correct behavior: all three true pairs are distinct → zero duplicates.
+// Buggy behavior: one of the cross-paired "shared" combinations collides with
+// "control" and produces a false duplicate.
+#[test]
+fn b11b_cross_rg_same_qname_same_lb_not_cross_matched() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("in.bam");
+    let output = dir.path().join("out.bam");
+    let metrics = dir.path().join("out.metrics.txt");
+
+    let a_r1 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(900),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let a_r2 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(900),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let b_r1 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(200),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(800),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+    let b_r2 = ReadSpec {
+        qname: "shared",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(800),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(200),
+        rg: Some("rg2"),
+        ..Default::default()
+    };
+    let c_r1 = ReadSpec {
+        qname: "control",
+        flags: 0x1 | 0x40 | 0x20,
+        ref_name: Some("chr1"),
+        pos: Some(100),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(800),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+    let c_r2 = ReadSpec {
+        qname: "control",
+        flags: 0x1 | 0x80 | 0x10,
+        ref_name: Some("chr1"),
+        pos: Some(800),
+        mate_ref_name: Some("chr1"),
+        mate_pos: Some(100),
+        rg: Some("rg1"),
+        ..Default::default()
+    };
+
+    BamBuilder::new()
+        .reference("chr1", 100_000)
+        .read_group("rg1", "lib1")
+        .read_group("rg2", "lib1")
+        .add_read(a_r1)
+        .add_read(c_r1)
+        .add_read(b_r1)
+        .add_read(b_r2)
+        .add_read(c_r2)
+        .add_read(a_r2)
+        .write(&input)
+        .unwrap();
+
+    run_markdup_with_metrics(&input, &output, &metrics).unwrap();
+
+    let dups = dup_qnames_set(&output);
+    assert!(
+        dups.is_empty(),
+        "shared-QNAME mates in different RGs must not cross-match even when LB is shared, got {:?}",
+        dups
+    );
+    let counts = pair_count_by_qname(&output);
+    assert_eq!(counts.get("shared").copied().unwrap_or(0), 4);
+    assert_eq!(counts.get("control").copied().unwrap_or(0), 2);
+
+    let recs = parse_metrics(&metrics).unwrap();
+    assert_eq!(recs[0].read_pair_duplicates, 0);
+    assert_eq!(recs[0].read_pairs_examined, 3);
 }
 
 // =============================================================================

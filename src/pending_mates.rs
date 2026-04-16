@@ -20,27 +20,28 @@ pub struct PendingMate {
     pub library_idx: u8,
 }
 
-/// Compute 64-bit FxHash of a QNAME byte slice, scoped by library.
+/// Compute 64-bit FxHash of a mate-lookup key.
 ///
 /// Picard (research §15) keys its mate lookup by `readGroupId + readName` so
 /// reads with identical QNAMEs in different read groups do not accidentally
-/// pair. We use `library_idx` (post-@RG resolution) for the same effect —
-/// this matches Picard's semantics because Picard itself groups read groups
-/// by their `LB` field when assigning library IDs.
-pub fn qname_hash(qname: &[u8], library_idx: u8) -> u64 {
-    use std::hash::{Hash, Hasher};
+/// pair. This must stay scoped to the raw RG tag value, not the dedup
+/// `library_idx`: different RGs may share the same LB and still must not be
+/// eligible to mate with each other.
+pub fn qname_hash(qname: &[u8], read_group: Option<&[u8]>) -> u64 {
+    use std::hash::Hash;
     let mut hasher = rustc_hash::FxHasher::default();
-    library_idx.hash(&mut hasher);
+    read_group.unwrap_or(b"").hash(&mut hasher);
     qname.hash(&mut hasher);
     std::hash::Hasher::finish(&hasher)
 }
 
-/// Compute 32-bit check hash from first 4 bytes of QNAME.
-pub fn check_hash(qname: &[u8]) -> u32 {
-    let mut bytes = [0u8; 4];
-    let len = qname.len().min(4);
-    bytes[..len].copy_from_slice(&qname[..len]);
-    u32::from_le_bytes(bytes)
+/// Compute a truncated check hash for collision detection inside one bucket.
+pub fn check_hash(qname: &[u8], read_group: Option<&[u8]>) -> u32 {
+    use std::hash::Hash;
+    let mut hasher = rustc_hash::FxHasher::default();
+    read_group.unwrap_or(b"").hash(&mut hasher);
+    qname.hash(&mut hasher);
+    std::hash::Hasher::finish(&hasher) as u32
 }
 
 /// Buffer for pending mates. Keyed by QNAME hash.
@@ -110,10 +111,10 @@ impl PendingMateBuffer {
 mod tests {
     use super::*;
 
-    fn make_pending(qname: &[u8], record_id: u64) -> PendingMate {
+    fn make_pending(qname: &[u8], read_group: Option<&[u8]>, record_id: u64) -> PendingMate {
         PendingMate {
-            name_hash: qname_hash(qname, 0),
-            check_hash: check_hash(qname),
+            name_hash: qname_hash(qname, read_group),
+            check_hash: check_hash(qname, read_group),
             ref_id: 0,
             unclipped_5prime: 1000,
             is_reverse: false,
@@ -129,7 +130,7 @@ mod tests {
     fn insert_and_remove() {
         let mut buf = PendingMateBuffer::new();
         let qname = b"HISEQ:1:1:1000:2000";
-        let mate = make_pending(qname, 0);
+        let mate = make_pending(qname, Some(b"rg1"), 0);
         let nh = mate.name_hash;
         let ch = mate.check_hash;
 
@@ -151,13 +152,13 @@ mod tests {
     #[test]
     fn peak_tracking() {
         let mut buf = PendingMateBuffer::new();
-        buf.insert(make_pending(b"READ_A", 0));
-        buf.insert(make_pending(b"READ_B", 1));
-        buf.insert(make_pending(b"READ_C", 2));
+        buf.insert(make_pending(b"READ_A", Some(b"rg1"), 0));
+        buf.insert(make_pending(b"READ_B", Some(b"rg1"), 1));
+        buf.insert(make_pending(b"READ_C", Some(b"rg1"), 2));
         assert_eq!(buf.peak(), 3);
 
-        let nh = qname_hash(b"READ_A", 0);
-        let ch = check_hash(b"READ_A");
+        let nh = qname_hash(b"READ_A", Some(b"rg1"));
+        let ch = check_hash(b"READ_A", Some(b"rg1"));
         buf.remove(nh, ch);
         assert_eq!(buf.len(), 2);
         assert_eq!(buf.peak(), 3); // Peak doesn't decrease
@@ -166,8 +167,8 @@ mod tests {
     #[test]
     fn drain_orphans() {
         let mut buf = PendingMateBuffer::new();
-        buf.insert(make_pending(b"ORPHAN_1", 0));
-        buf.insert(make_pending(b"ORPHAN_2", 1));
+        buf.insert(make_pending(b"ORPHAN_1", Some(b"rg1"), 0));
+        buf.insert(make_pending(b"ORPHAN_2", Some(b"rg1"), 1));
 
         let orphans = buf.drain_all();
         assert_eq!(orphans.len(), 2);
@@ -178,8 +179,8 @@ mod tests {
     fn collision_handling() {
         // Two different QNAMEs stored under same hash bucket
         let mut buf = PendingMateBuffer::new();
-        let m1 = make_pending(b"READ_A", 0);
-        let m2 = make_pending(b"READ_B", 1);
+        let m1 = make_pending(b"READ_A", Some(b"rg1"), 0);
+        let m2 = make_pending(b"READ_B", Some(b"rg1"), 1);
 
         // Even if they happen to share a hash, check_hash distinguishes them
         buf.insert(m1.clone());
@@ -194,5 +195,24 @@ mod tests {
         let found2 = buf.remove(m2.name_hash, m2.check_hash);
         assert!(found2.is_some());
         assert_eq!(found2.unwrap().record_id, 1);
+    }
+
+    #[test]
+    fn same_qname_different_read_groups_use_different_lookup_keys() {
+        let mut buf = PendingMateBuffer::new();
+        let rg1 = make_pending(b"SHARED", Some(b"rg1"), 0);
+        let rg2 = make_pending(b"SHARED", Some(b"rg2"), 1);
+
+        assert_ne!(rg1.name_hash, rg2.name_hash);
+        assert_ne!(rg1.check_hash, rg2.check_hash);
+
+        buf.insert(rg1.clone());
+        buf.insert(rg2.clone());
+
+        let found = buf.remove(rg2.name_hash, rg2.check_hash).unwrap();
+        assert_eq!(found.record_id, 1);
+
+        let found = buf.remove(rg1.name_hash, rg1.check_hash).unwrap();
+        assert_eq!(found.record_id, 0);
     }
 }
