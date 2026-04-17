@@ -207,10 +207,12 @@ pub fn write_metrics(
                 let x = i as f64;
                 // Picard's DuplicationMetrics.estimateRoi (research §9):
                 //   CoverageMult(x) = L * (1 - exp(-x * N / L)) / unique
-                let cov_mult = if unique > 0.0 && l > 0.0 {
+                // Picard only computes CoverageMult for BIN 1–100; bins > 100
+                // get CoverageMult = 0 (Picard parity).
+                let cov_mult = if i <= 100 && unique > 0.0 && l > 0.0 {
                     l * (1.0 - (-x * n / l).exp()) / unique
                 } else {
-                    1.0
+                    0.0
                 };
                 // non_optical_sets == all_sets since we don't track optical dups.
                 writeln!(
