@@ -54,20 +54,7 @@ when reproducing a bug is required for byte-identical duplicate flags.**
 - **Impact:** `samtools view -H` still shows the @PG header. Per-record
   lineage is lost. No known downstream consumer affected.
 
-### 4. `CLEAR_DT` not implemented (pre-existing DT tags preserved)
-
-- **Picard:** Defaults to `true`; strips `DT:Z:...` tags from input before
-  writing output.
-- **Ours:** Preserves whatever was in the input.
-- **Why:** We don't write DT tags ourselves, and stripping them would
-  require walking every record's data field. The only way input has DT
-  is a prior Picard run — in which case the tags are stale anyway, but
-  harmless.
-- **Impact:** None unless the input was already Picard-processed. In
-  that rare case, DT may be misleading; prefer running from a clean
-  aligner output.
-
-### 5. Missing `RG` tag → `library_idx = 0`, not NPE
+### 4. Missing `RG` tag → `library_idx = 0`, not NPE
 
 - **Picard:** NullPointerException / `ClassCastException` on records
   lacking the `RG` field.
@@ -81,7 +68,7 @@ when reproducing a bug is required for byte-identical duplicate flags.**
   library's dup-group space; documented here so users know to
   validate their RG annotation.
 
-### 6. Score type is `u32`, not Picard's `short` with silent overflow
+### 5. Score type is `u32`, not Picard's `short` with silent overflow
 
 - **Picard:** Accumulates `SUM_OF_BASE_QUALITIES` in a `short`, wrapping
   at 32,767 silently — so a read of length > ~440bp with uniformly high
@@ -98,7 +85,7 @@ when reproducing a bug is required for byte-identical duplicate flags.**
   through markdup-wea and want byte-identical Picard output, this is
   the one place to expect differences.
 
-### 7. MQ=0 chimeric-pair missed-duplicate quirk (Picard issue #1285) — reproduced
+### 6. MQ=0 chimeric-pair missed-duplicate quirk (Picard issue #1285) — reproduced
 
 - **Picard:** A documented bug where chimeric pairs with one mate at
   MAPQ=0 can be missed during duplicate detection, because Picard does
@@ -113,7 +100,7 @@ when reproducing a bug is required for byte-identical duplicate flags.**
 
 ## Approximations (small divergences from Picard's exact algorithm)
 
-### 8. Orphan-vs-fragment same-locus competition
+### 7. Orphan-vs-fragment same-locus competition
 
 - **Picard (research §7):** An orphan paired read (its mate never
   arrived; unresolved at EOF) is pushed into `fragSort` and competes
@@ -138,7 +125,7 @@ when reproducing a bug is required for byte-identical duplicate flags.**
   fragment-only false positives, inspect whether those positions
   harbor orphans in the input.
 
-### 9. `estimate_library_size` bail-out when unique ≥ total pairs
+### 8. `estimate_library_size` bail-out when unique ≥ total pairs
 
 - **Picard:** Throws `IllegalStateException`, bubbling up as a fatal
   error.
@@ -170,9 +157,9 @@ when reproducing a bug is required for byte-identical duplicate flags.**
 If you are evaluating whether markdup-wea is safe to substitute for
 Picard in your pipeline, the acceptance test is:
 
-1. Entries 1–7 (intentional) — read and confirm the rationale applies
+1. Entries 1–6 (intentional) — read and confirm the rationale applies
    to your data.
-2. Entries 8–9 (approximations) — confirm the impact bounds are
+2. Entries 7–8 (approximations) — confirm the impact bounds are
    acceptable for your workflow.
 3. Phase C byte-diff against Picard on a representative sample of
    your own data — the ultimate ground-truth test. See `BENCHMARK.md`

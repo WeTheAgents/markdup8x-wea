@@ -74,6 +74,8 @@ pub struct ReadSpec {
     pub qual: Vec<u8>,
     /// Optional RG tag value. If set, a matching @RG must have been added to the builder.
     pub rg: Option<&'static str>,
+    /// Optional DT tag value for output-side fidelity tests.
+    pub dt: Option<&'static str>,
 }
 
 impl Default for ReadSpec {
@@ -91,6 +93,7 @@ impl Default for ReadSpec {
             seq: b"",
             qual: Vec::new(),
             rg: None,
+            dt: None,
         }
     }
 }
@@ -279,7 +282,16 @@ fn build_record(spec: &ReadSpec, ref_map: &HashMap<String, usize>) -> anyhow::Re
         b = b.set_data(data);
     }
 
-    Ok(b.build())
+    let mut record = b.build();
+    if let Some(dt) = spec.dt {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        record
+            .data_mut()
+            .insert(Tag::new(b'D', b'T'), Value::String(BString::from(dt)));
+    }
+
+    Ok(record)
 }
 
 fn parse_cigar(s: &str) -> anyhow::Result<Cigar> {
@@ -360,6 +372,40 @@ pub fn read_flags_by_qname_all(path: &Path) -> HashMap<String, Vec<u16>> {
             map.entry(n).or_default().push(u16::from(rec.flags()));
         }
     }
+    map
+}
+
+/// Read a string-valued SAM tag from every record, grouped by QNAME.
+pub fn read_string_tag_by_qname(path: &Path, tag: [u8; 2]) -> HashMap<String, Vec<Option<String>>> {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record::data::field::Value;
+
+    let mut map: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    let file = File::open(path).expect("open output BAM");
+    let mut reader = bam::io::Reader::new(file);
+    let _header = reader.read_header().expect("read header");
+    let mut rec = bam::Record::default();
+    let tag = Tag::new(tag[0], tag[1]);
+
+    while reader.read_record(&mut rec).expect("read record") > 0 {
+        let name = rec.name().map(|n| {
+            let b: &[u8] = n.as_ref();
+            String::from_utf8_lossy(b).to_string()
+        });
+        if let Some(n) = name {
+            let value = rec
+                .data()
+                .get(&tag)
+                .transpose()
+                .expect("decode tag")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(String::from_utf8_lossy(s.as_ref()).to_string()),
+                    _ => None,
+                });
+            map.entry(n).or_default().push(value);
+        }
+    }
+
     map
 }
 

@@ -70,25 +70,61 @@ pub fn validate_sort_order(header: &sam::Header, assume_sort_order: Option<&str>
 
 /// Runtime sort-order checker.
 pub struct SortOrderEnforcer {
+    seen_any: bool,
+    seen_unmapped_tail: bool,
     prev_tid: Option<usize>,
     prev_pos: i64,
 }
 
 impl SortOrderEnforcer {
     pub fn new() -> Self {
-        Self { prev_tid: None, prev_pos: -1 }
+        Self { seen_any: false, seen_unmapped_tail: false, prev_tid: None, prev_pos: -1 }
     }
 
     pub fn check(&mut self, tid: Option<usize>, pos: i64) -> Result<()> {
-        if let (Some(cur), Some(prev)) = (tid, self.prev_tid) {
-            if cur == prev && pos < self.prev_pos {
-                bail!("Not coordinate-sorted: pos {} follows {} on same ref", pos, self.prev_pos);
+        match tid {
+            Some(cur_tid) => {
+                if self.seen_unmapped_tail {
+                    bail!("Not coordinate-sorted: mapped record on reference {} follows unmapped tail", cur_tid);
+                }
+
+                if let Some(prev_tid) = self.prev_tid {
+                    if cur_tid < prev_tid {
+                        bail!(
+                            "Not coordinate-sorted: reference {} follows later reference {}",
+                            cur_tid,
+                            prev_tid
+                        );
+                    }
+
+                    if cur_tid == prev_tid && pos < self.prev_pos {
+                        bail!(
+                            "Not coordinate-sorted: pos {} follows {} on same ref",
+                            pos,
+                            self.prev_pos
+                        );
+                    }
+                }
+
+                self.prev_tid = Some(cur_tid);
+                self.prev_pos = pos;
+            }
+            None => {
+                if self.seen_any {
+                    self.seen_unmapped_tail = true;
+                }
+                self.prev_tid = None;
+                self.prev_pos = -1;
             }
         }
-        if tid != self.prev_tid { self.prev_pos = -1; }
-        self.prev_tid = tid;
-        self.prev_pos = pos;
+        self.seen_any = true;
         Ok(())
+    }
+}
+
+impl Default for SortOrderEnforcer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -108,6 +144,22 @@ mod tests {
         let mut e = SortOrderEnforcer::new();
         assert!(e.check(Some(0), 50000).is_ok());
         assert!(e.check(Some(1), 100).is_ok());
+    }
+
+    #[test]
+    fn sort_enforcer_rejects_chromosome_regression() {
+        let mut e = SortOrderEnforcer::new();
+        assert!(e.check(Some(0), 100).is_ok());
+        assert!(e.check(Some(1), 100).is_ok());
+        assert!(e.check(Some(0), 200).is_err());
+    }
+
+    #[test]
+    fn sort_enforcer_rejects_mapped_after_unmapped_tail() {
+        let mut e = SortOrderEnforcer::new();
+        assert!(e.check(Some(0), 100).is_ok());
+        assert!(e.check(None, -1).is_ok());
+        assert!(e.check(Some(1), 100).is_err());
     }
 
     #[test]

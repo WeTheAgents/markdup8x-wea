@@ -1,0 +1,140 @@
+[environment]
+label = "hetzner-cpx62"
+java = "java"
+samtools = "samtools"
+
+[picard]
+version = "3.4.0"
+jar = "/opt/picard/picard.jar"
+jar_sha256 = "REPLACE_ME"
+command = ["java", "-jar", "/opt/picard/picard.jar", "MarkDuplicates"]
+validation_stringency = "STRICT"
+compression_level = 5
+add_pg_tag_to_reads = true
+clear_dt = true
+remove_duplicates = false
+remove_sequencing_duplicates = false
+extra_args = []
+
+[markdup]
+command = ["cargo", "run", "--release", "--"]
+threads = 4
+assume_sort_order = "coordinate"
+remove_duplicates = false
+extra_args = []
+
+[compare]
+command = ["cargo", "run", "--release", "--bin", "validation_compare", "--"]
+
+[corpus]
+results_root = "validation-results/hetzner"
+notes = """
+Freeze the real Hetzner pipeline contract here before claiming parity:
+- copy the exact Picard command line from the running pipeline
+- pin picard.jar SHA256, Java version, samtools version, and effective defaults
+- record input BAM checksums and, once generated, the expected Picard outputs
+"""
+
+[[samples]]
+id = "WT_REP1"
+cohort = "yeast"
+input_bam = "/data/yeast/WT_REP1.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "WT_REP2"
+cohort = "yeast"
+input_bam = "/data/yeast/WT_REP2.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "RAP1_UNINDUCED_REP2"
+cohort = "yeast"
+input_bam = "/data/yeast/RAP1_UNINDUCED_REP2.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "RAP1_UNINDUCED_REP1"
+cohort = "yeast"
+input_bam = "/data/yeast/RAP1_UNINDUCED_REP1.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "RAP1_IAA_30M_REP1"
+cohort = "yeast"
+input_bam = "/data/yeast/RAP1_IAA_30M_REP1.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "K562_REP1"
+cohort = "encode"
+input_bam = "/data/encode/K562_REP1.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "GM12878_REP1"
+cohort = "encode"
+input_bam = "/data/encode/GM12878_REP1.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "GM12878_REP2"
+cohort = "encode"
+input_bam = "/data/encode/GM12878_REP2.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "H1_REP1"
+cohort = "encode"
+input_bam = "/data/encode/H1_REP1.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "H1_REP2"
+cohort = "encode"
+input_bam = "/data/encode/H1_REP2.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "K562_REP2"
+cohort = "encode"
+input_bam = "/data/encode/K562_REP2.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "MCF7_REP1"
+cohort = "encode"
+input_bam = "/data/encode/MCF7_REP1.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""
+
+[[samples]]
+id = "MCF7_REP2"
+cohort = "encode"
+input_bam = "/data/encode/MCF7_REP2.sorted.bam"
+input_sha256 = "REPLACE_ME"
+expected_picard_bam = ""
+expected_picard_metrics = ""

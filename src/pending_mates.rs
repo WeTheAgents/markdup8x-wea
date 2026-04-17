@@ -91,6 +91,10 @@ impl PendingMateBuffer {
         self.count
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Peak number of pending mates seen.
     pub fn peak(&self) -> usize {
         self.peak
@@ -104,6 +108,12 @@ impl PendingMateBuffer {
         }
         self.count = 0;
         orphans
+    }
+}
+
+impl Default for PendingMateBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

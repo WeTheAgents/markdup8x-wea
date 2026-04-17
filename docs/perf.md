@@ -131,6 +131,150 @@ across all ten columns for every (`*_wea`, `*_picard`) pair:
   documented as Deviation #1).
 
 
+## Phase E — post-markdup parallelism on the same box
+
+After markdup-wea replaces Picard, the next bottleneck on the BAM-side
+chain becomes **Qualimap rnaseq** and **bedtools genomecov**. Both tools
+are inherently single-threaded (no CLI flag exists to make them
+otherwise — verified on Qualimap v2.3 `qualimap rnaseq --help` and the
+nf-core `bedtools/genomecov` module). nf-core/rnaseq's
+`modules/nf-core/qualimap/rnaseq/main.nf` accordingly passes no
+threading flag — it's not an oversight, the flag doesn't exist.
+
+What nf-core *does* do is rely on Nextflow's sample-level scheduler to
+fan out across samples — but its default resource requests over-budget
+both tools and serialize them on small boxes:
+
+| Tool | nf-core label | Requested CPU | Requested RAM | Real CPU | Real RSS |
+|------|---------------|--------------:|--------------:|---------:|---------:|
+| Qualimap rnaseq | `process_medium` | 6 | **36 GB** | 1 | 5–6 GB |
+| bedtools genomecov | `process_single` | 1 | 6 GB | 1 | 4–14 GB |
+
+On a 30 GB box (cpx62) Nextflow refuses to schedule Qualimap at all
+without lowering `max_memory` (request 36 GB > 30 GB available). On a
+64 GB box only one Qualimap fits at a time (64/36 = 1) despite the
+process really only using 6 GB. On a 256 GB box: 7 by default vs 40 if
+budgeted to actual footprint. **The bottleneck is the request size, not
+the algorithm.**
+
+Phase E bypasses Nextflow and runs a hand-rolled parallel batch on the
+same cpx62 (16 vCPU / 30 GB) over the same 8 ENCODE samples
+(K562_REP1/2, GM12878_REP1/2, H1_REP1/2, MCF7_REP1/2). Inputs are the
+markdup-wea outputs from Phase D, on local NVMe.
+
+### Solo baseline (1 sample, K562_REP1)
+
+| Tool | Wall | Peak RSS | CPU% |
+|------|-----:|---------:|-----:|
+| Qualimap rnaseq | 58:57 | 5.7 GB | 101% |
+| bedtools genomecov (forward + reverse strand) | 6:38 | 4.1 GB | 105% |
+
+### Qualimap rnaseq — 4-wide × 2 waves on 8 samples
+
+`--java-mem-size=7000M` per process (real RSS ~5 GB). 4 × 5 = 20 GB
+peak, comfortable on a 30 GB box.
+
+| Sample | Wave | Wall | RSS |
+|--------|-----:|-----:|----:|
+| K562_REP1 | 1 | 56:51 | 5.4 GB |
+| GM12878_REP1 | 1 | 1:01:48 | 4.9 GB |
+| GM12878_REP2 | 1 | 1:00:56 | 5.2 GB |
+| H1_REP1 | 1 | **1:10:57** | 4.9 GB |
+| H1_REP2 | 2 | 59:57 | 5.3 GB |
+| K562_REP2 | 2 | 1:11:56 | 5.3 GB |
+| MCF7_REP1 | 2 | 1:09:16 | 5.2 GB |
+| MCF7_REP2 | 2 | 1:11:53 | 4.9 GB |
+
+* **Wave 1: 70:58 wall** (limited by H1_REP1)
+* **Wave 2: 71:56 wall** (limited by K562_REP2)
+* **Total: 2:22:54 wall**
+
+vs serial (8 × 58:57 = 7:51:36): **3.30× speedup**, all 8
+`qualimapReport.html` produced, exit 0 across the board. Per-sample
+wall under parallel oversubscription is essentially unchanged from solo
+(K562_REP1 even came out marginally faster, 56:51 vs 58:57 — within
+noise) — Java is single-thread per process, 4 instances coexist
+peacefully on 16 vCPU (4 × 101% = ~404% combined).
+
+### bedtools genomecov — 2-wide × 4 waves on 8 samples
+
+| Sample | Wave | Wall | RSS | bedGraph (rev+fwd) |
+|--------|-----:|-----:|----:|-------------------:|
+| K562_REP1 | 1 | 6:45 | 4.1 GB | 285 + 289 MB |
+| GM12878_REP1 | 1 | 7:20 | 6.1 GB | 416 + 430 MB |
+| GM12878_REP2 | 2 | 7:25 | 6.2 GB | 416 + 431 MB |
+| H1_REP1 | 2 | 8:56 | 10.1 GB | 659 + 701 MB |
+| H1_REP2 | 3 | 7:25 | 8.6 GB | 566 + 598 MB |
+| K562_REP2 | 3 | 8:22 | 5.6 GB | 388 + 393 MB |
+| MCF7_REP1 | 4 | 9:38 | **13.8 GB** | 900 + 945 MB |
+| MCF7_REP2 | 4 | 9:37 | 13.1 GB | 856 + 900 MB |
+
+* **Total: 34:16 wall**
+* vs serial (8 × 6:38 = 53:04): **1.55× speedup**
+
+All 16 bedGraph files non-empty, exit 0 across the board.
+
+#### OOM lesson — the failed 4-wide attempt
+
+The first attempt at `4-wide × 2 waves` for bedtools OOMed during
+wave 2. bedtools genomecov's RSS is **not** constant — it scales with
+sample complexity (4 GB for K562_REP1, 14 GB for MCF7_REP1). Wave 2
+of the 4-wide run hit 8.6 + 5.6 + 11.8 + 13.1 ≈ **39 GB** combined,
+the kernel's OOM killer reaped MCF7_REP1's bedtools (`Killed process
+59114 (bedtools) total-vm:14314444kB` in dmesg), output truncated to 0
+bytes. **2-wide is the safe ceiling on a 30 GB box.** A 64 GB box
+would tolerate 4-wide comfortably.
+
+### Combined picture — heavy post-alignment steps
+
+| Step | Solo baseline | 8-sample serial | 8-sample parallel | Speedup |
+|------|--------------:|----------------:|------------------:|--------:|
+| markdup-wea (Phase D, 8 × `-@ 1`) | 9:47 | 1:18 h | **15:24** | **5.1×** |
+| Qualimap rnaseq (4-wide × 2 waves) | 58:57 | 7:51 h | **2:22:54** | **3.30×** |
+| bedtools genomecov (2-wide × 4 waves) | 6:38 | 53:04 | **34:16** | **1.55×** |
+| **Combined three steps** | — | **9:02 h** | **3:12:34** | **~2.8×** |
+
+For comparison, the same three steps with stock Picard MarkDuplicates
+serial + nf-core defaults on a same-class 30 GB box would be roughly:
+`Picard 4:05 h + Qualimap 7:51 h + bedtools 53 m = ~12:49 h` (Picard
+must serialize because each instance asks for ~17 GB heap; Qualimap
+also serializes because nf-core requests 36 GB > available 30 GB).
+Replacing Picard and running Qualimap+bedtools at their actual memory
+footprint gets it down to **~3:13 h on the same box — roughly 4× total
+on heavy steps, with no hardware upgrade**.
+
+### Key takeaways
+
+1. **Qualimap rnaseq is the longest pole** and stays the longest pole
+   even after our parallelism. 80 minutes of single-threaded Java
+   per sample × N is intrinsic — no Picard-style replacement candidate
+   in widespread use yet.
+2. **Memory budgets in nf-core resource labels are conservative
+   over-estimates**. Reducing `process_medium` for Qualimap from 36 GB
+   to e.g. 8 GB unlocks the same parallelism we measured here, without
+   custom batch scripts.
+3. **bedtools genomecov RSS is sample-dependent** (4–14 GB on this
+   dataset). Any parallelism config must budget for the largest, not
+   the average.
+4. **The cpx62 sweet spot for this pipeline post-markdup is
+   `Qualimap × 4`, `bedtools × 2`** (and bigger boxes scale Qualimap
+   linearly, bedtools sub-linearly until I/O saturates).
+
+### How to reproduce
+
+The benchmark scripts live on the Hetzner box at:
+- `/root/parallel_test/qualimap_bench.sh` — 4-wide × 2 waves
+- `/root/parallel_test/bedtools_bench.sh` — 2-wide × 4 waves
+- `/root/parallel_test/baseline.sh` — single-sample solo baselines
+
+Inputs: `/root/parallel_test/<sample>.wea.bam` (markdup-wea outputs from
+Phase D, byte-identical to Picard's output per `samtools view -f 1024`
+QNAME diff).
+
+Tools used: Qualimap v2.3 (downloaded tarball, deprecated
+`-XX:MaxPermSize=1024m` removed from launcher for Java 21
+compatibility), bedtools 2.31.1 (apt).
+
 ## How to reproduce
 
 The numbers in this document came from `/root/markdup-test/threading_bench.sh`
