@@ -5,14 +5,20 @@ use crate::io;
 use crate::metrics;
 use crate::scan;
 use anyhow::{bail, Context, Result};
+use bstr::BString;
 use log::info;
 use noodles::bam;
 use noodles::bgzf;
+use noodles::sam;
 use noodles::sam::alignment::io::Write as AlignmentWrite;
 use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::RecordBuf;
-use std::path::{Path, PathBuf};
+use noodles::sam::header::record::value::map::header::Version;
+use noodles::sam::header::record::value::map::{self, Program};
+use noodles::sam::header::record::value::Map;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 
 fn normalized_path(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
@@ -61,7 +67,53 @@ pub fn run(
 
     // === Pass 2: read records, convert to RecordBuf, modify flags, write ===
     info!("Pass 2: writing output...");
-    let (mut reader2, header2) = io::open_bam(&actual_path, n_threads)?;
+    let (mut reader2, mut header2) = io::open_bam(&actual_path, n_threads)?;
+
+    // Picard parity: bump @HD VN to 1.6, preserving SO:coordinate.
+    {
+        use sam::header::record::value::map::header::tag::SORT_ORDER;
+        let mut hd = Map::<map::Header>::new(Version::new(1, 6));
+        if let Some(existing) = header2.header() {
+            if let Some(so) = existing.other_fields().get(&SORT_ORDER) {
+                hd.other_fields_mut().insert(SORT_ORDER, so.clone());
+            }
+        }
+        *header2.header_mut() = Some(hd);
+    }
+
+    // Picard parity: add @PG ID:MarkDuplicates, chained to the last existing PG.
+    {
+        use sam::header::record::value::map::program::tag::{
+            COMMAND_LINE, NAME, PREVIOUS_PROGRAM_ID, VERSION,
+        };
+        let mut pg = Map::<Program>::default();
+        pg.other_fields_mut()
+            .insert(VERSION, BString::from(env!("CARGO_PKG_VERSION")));
+        pg.other_fields_mut()
+            .insert(NAME, BString::from("MarkDuplicates"));
+        // PP: chain to the last existing @PG ID (leaf of the PG chain).
+        if let Ok(leaves) = header2.programs().leaves() {
+            if let Some((leaf_id, _)) = leaves.last() {
+                let pp_bytes: &[u8] = leaf_id.as_ref();
+                pg.other_fields_mut()
+                    .insert(PREVIOUS_PROGRAM_ID, BString::from(pp_bytes));
+            }
+        }
+        // CL: Picard writes its invocation; we write ours (honest provenance).
+        let out_str = output.unwrap_or("-");
+        let cl = format!(
+            "markdup-wea {} INPUT={} OUTPUT={}",
+            env!("CARGO_PKG_VERSION"),
+            input,
+            out_str
+        );
+        pg.other_fields_mut()
+            .insert(COMMAND_LINE, BString::from(cl));
+        header2
+            .programs_mut()
+            .add("MarkDuplicates", pg)
+            .context("Failed to add @PG MarkDuplicates to header")?;
+    }
 
     // Pass-2 writer wraps the destination in MultithreadedWriter for parallel
     // BGZF compression. We then construct bam::io::Writer::from(bgzf_writer)
@@ -92,6 +144,11 @@ pub fn run(
         // Convert to RecordBuf to modify flags
         let mut rec_buf = RecordBuf::try_from_alignment_record(&header2, &record)?;
         rec_buf.data_mut().remove(&Tag::new(b'D', b'T'));
+        // Picard parity: ADD_PG_TAG_TO_READS=true (Picard default).
+        rec_buf.data_mut().insert(
+            Tag::new(b'P', b'G'),
+            Value::String(BString::from("MarkDuplicates")),
+        );
 
         let current_flags = u16::from(rec_buf.flags());
         let new_flags = if is_dup {
