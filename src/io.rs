@@ -18,16 +18,32 @@ pub type BamReader = bam::io::Reader<bgzf::MultithreadedReader<File>>;
 /// The concrete BAM writer type (multithreaded BGZF wrapping inner W).
 pub type BamWriter<W> = bam::io::Writer<bgzf::MultithreadedWriter<W>>;
 
+/// Format-agnostic alignment reader. Hot-path consumers depend on this enum
+/// rather than a concrete reader type, so additional formats (CRAM, etc.) can
+/// be added later without touching scan/markdup signatures.
+pub enum AlignmentReader {
+    Bam(BamReader),
+}
+
+impl AlignmentReader {
+    #[inline]
+    pub fn read_record(&mut self, record: &mut bam::Record) -> io::Result<usize> {
+        match self {
+            AlignmentReader::Bam(r) => r.read_record(record),
+        }
+    }
+}
+
 /// Open a BAM reader from a file path with `threads` BGZF decode workers
 /// (clamped to ≥1). Worker threads run BGZF decompression in the background;
 /// the scan loop itself remains sequential by algorithm design.
-pub fn open_bam(path: &str, threads: usize) -> Result<(BamReader, sam::Header)> {
+pub fn open_bam(path: &str, threads: usize) -> Result<(AlignmentReader, sam::Header)> {
     let file = File::open(path).with_context(|| format!("Failed to open BAM: {}", path))?;
     let workers = NonZeroUsize::new(threads.max(1)).unwrap();
     let bgzf_reader = bgzf::MultithreadedReader::with_worker_count(workers, file);
     let mut reader = bam::io::Reader::from(bgzf_reader);
     let header = reader.read_header().context("Failed to read BAM header")?;
-    Ok((reader, header))
+    Ok((AlignmentReader::Bam(reader), header))
 }
 
 /// If input is "-", copy stdin to temp file. Returns (actual_path, Option<temp_file>).

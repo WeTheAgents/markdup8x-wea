@@ -154,7 +154,7 @@ fn extract_mate_alignment_start(record: &bam::Record) -> Result<Option<i64>> {
 
 /// Run Pass 1.
 pub fn scan_pass(
-    reader: &mut crate::io::BamReader,
+    reader: &mut crate::io::AlignmentReader,
     header: &sam::Header,
 ) -> Result<ScanResult> {
     let (rg_to_lib, _lib_names) = build_library_map(header);
