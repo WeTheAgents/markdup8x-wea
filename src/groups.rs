@@ -9,9 +9,17 @@ use std::collections::BTreeMap;
 
 /// Grouping key for paired-end reads.
 /// Ordered: lo = lower (ref_id, position), hi = higher.
+///
+/// Field order mirrors Picard's `ReadEndsMDComparator` (library → barcode →
+/// read1/read2 → coords). Barcode hash defaults to 0 when no `BARCODE_TAG` /
+/// `READ_ONE_BARCODE_TAG` / `READ_TWO_BARCODE_TAG` is configured — keys then
+/// behave identically to the pre-Track-A layout. See `docs/umi_semantics.md`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PairedEndKey {
     pub library_idx: u8,
+    pub barcode_hash: i32,
+    pub read1_barcode_hash: i32,
+    pub read2_barcode_hash: i32,
     pub ref_id_lo: i32,
     pub pos_lo: i64,
     pub is_reverse_lo: bool,
@@ -21,9 +29,12 @@ pub struct PairedEndKey {
 }
 
 /// Grouping key for single-end reads.
+///
+/// `barcode_hash` defaults to 0 when no `BARCODE_TAG` is configured.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SingleEndKey {
     pub library_idx: u8,
+    pub barcode_hash: i32,
     pub ref_id: i32,
     pub unclipped_5prime: i64,
     pub is_reverse: bool,
@@ -300,6 +311,9 @@ mod tests {
 
         let key = PairedEndKey {
             library_idx: 0,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
             ref_id_lo: 0,
             pos_lo: 1000,
             is_reverse_lo: false,
@@ -328,6 +342,9 @@ mod tests {
 
         let key = PairedEndKey {
             library_idx: 0,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
             ref_id_lo: 0,
             pos_lo: 1000,
             is_reverse_lo: false,
@@ -368,6 +385,9 @@ mod tests {
 
         let key = PairedEndKey {
             library_idx: 0,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
             ref_id_lo: 0,
             pos_lo: 1000,
             is_reverse_lo: false,
@@ -409,6 +429,9 @@ mod tests {
         // Group at pos 1000/1500
         let key1 = PairedEndKey {
             library_idx: 0,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
             ref_id_lo: 0,
             pos_lo: 1000,
             is_reverse_lo: false,
@@ -436,6 +459,9 @@ mod tests {
         // Group at pos 2000/3000
         let key2 = PairedEndKey {
             library_idx: 0,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
             ref_id_lo: 0,
             pos_lo: 2000,
             is_reverse_lo: false,
@@ -467,6 +493,7 @@ mod tests {
 
         let key = SingleEndKey {
             library_idx: 0,
+            barcode_hash: 0,
             ref_id: 0,
             unclipped_5prime: 1000,
             is_reverse: false,
@@ -494,6 +521,7 @@ mod tests {
         // Different key triggers resolution of previous group
         let key2 = SingleEndKey {
             library_idx: 0,
+            barcode_hash: 0,
             ref_id: 0,
             unclipped_5prime: 2000,
             is_reverse: false,
@@ -523,6 +551,9 @@ mod tests {
 
         let key_lib0 = PairedEndKey {
             library_idx: 0,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
             ref_id_lo: 0,
             pos_lo: 1000,
             is_reverse_lo: false,
@@ -532,6 +563,9 @@ mod tests {
         };
         let key_lib1 = PairedEndKey {
             library_idx: 1,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
             ..key_lib0.clone()
         };
 
@@ -566,6 +600,7 @@ mod tests {
 
         let key = SingleEndKey {
             library_idx: 0,
+            barcode_hash: 0,
             ref_id: 0,
             unclipped_5prime: 1000,
             is_reverse: false,
@@ -598,6 +633,7 @@ mod tests {
 
         let key = SingleEndKey {
             library_idx: 0,
+            barcode_hash: 0,
             ref_id: 0,
             unclipped_5prime: 1000,
             is_reverse: false,
@@ -610,5 +646,67 @@ mod tests {
         tracker.flush(&mut dup_bits);
         assert_eq!(dup_bits.len(), 0);
         assert_eq!(tracker.reads_examined, 0);
+    }
+
+    // ---- Track A.1: barcode_hash dimension in keys ----
+
+    fn paired_template() -> PairedEndKey {
+        PairedEndKey {
+            library_idx: 0,
+            barcode_hash: 0,
+            read1_barcode_hash: 0,
+            read2_barcode_hash: 0,
+            ref_id_lo: 0,
+            pos_lo: 1000,
+            is_reverse_lo: false,
+            ref_id_hi: 0,
+            pos_hi: 1500,
+            is_reverse_hi: true,
+        }
+    }
+
+    #[test]
+    fn paired_key_distinct_barcode_hash_separate_groups() {
+        let k1 = PairedEndKey { barcode_hash: 100, ..paired_template() };
+        let k2 = PairedEndKey { barcode_hash: 200, ..paired_template() };
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn paired_key_picard_missing_barcode_default_31_distinct_from_zero() {
+        // BARCODE_TAG missing in Picard hashes to 31 (Objects.hash(null)).
+        // The "no flag configured" baseline is 0. The two must not collide.
+        let k_missing = PairedEndKey { barcode_hash: 31, ..paired_template() };
+        let k_default = PairedEndKey { barcode_hash: 0, ..paired_template() };
+        assert_ne!(k_missing, k_default);
+    }
+
+    #[test]
+    fn paired_key_read1_vs_read2_barcode_distinguish_groups() {
+        // (r1=A, r2=B) ≠ (r1=B, r2=A): A.2 must route firstOfPair correctly.
+        let k_ab = PairedEndKey {
+            read1_barcode_hash: 100,
+            read2_barcode_hash: 200,
+            ..paired_template()
+        };
+        let k_ba = PairedEndKey {
+            read1_barcode_hash: 200,
+            read2_barcode_hash: 100,
+            ..paired_template()
+        };
+        assert_ne!(k_ab, k_ba);
+    }
+
+    #[test]
+    fn single_key_distinct_barcode_hash_separate_groups() {
+        let k1 = SingleEndKey {
+            library_idx: 0,
+            barcode_hash: 100,
+            ref_id: 0,
+            unclipped_5prime: 1000,
+            is_reverse: false,
+        };
+        let k2 = SingleEndKey { barcode_hash: 200, ..k1.clone() };
+        assert_ne!(k1, k2);
     }
 }

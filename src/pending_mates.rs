@@ -5,7 +5,7 @@
 
 use rustc_hash::FxHashMap;
 
-/// Minimal metadata for a pending mate. Packed to ~52 bytes.
+/// Minimal metadata for a pending mate. Packed to ~60 bytes (post Track A.1).
 #[derive(Clone, Debug)]
 pub struct PendingMate {
     pub name_hash: u64,
@@ -18,6 +18,13 @@ pub struct PendingMate {
     pub quality_sum: u32,
     pub record_id: u64,
     pub library_idx: u8,
+    /// BARCODE_TAG hash carried from this record's RX (or equivalent). 0 when
+    /// the feature is off; A.2 wires the extractor.
+    pub barcode_hash: i32,
+    /// READ_ONE_BARCODE_TAG or READ_TWO_BARCODE_TAG hash for this record —
+    /// which one depends on the firstOfPair flag at pair-completion time.
+    /// 0 when the feature is off.
+    pub read_barcode_hash: i32,
 }
 
 /// Compute 64-bit FxHash of a mate-lookup key.
@@ -133,6 +140,8 @@ mod tests {
             quality_sum: 500,
             record_id,
             library_idx: 0,
+            barcode_hash: 0,
+            read_barcode_hash: 0,
         }
     }
 

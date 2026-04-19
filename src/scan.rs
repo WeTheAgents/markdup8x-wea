@@ -216,9 +216,11 @@ pub fn scan_pass(
         let tid_i32 = tid.map(|t| t as i32).unwrap_or(-1);
 
         if !is_paired || mate_unmapped {
+            // A.2 will populate barcode_hash from BARCODE_TAG.
             single_tracker.add_read(
                 SingleEndKey {
                     library_idx: lib_idx,
+                    barcode_hash: 0,
                     ref_id: tid_i32,
                     unclipped_5prime: uc5,
                     is_reverse,
@@ -248,9 +250,11 @@ pub fn scan_pass(
             // right now. Marker score=0, record_id=current_id (unused unless
             // something dereferences the Vec entry; the resolve code skips
             // markers before flagging).
+            // A.2 will populate barcode_hash from BARCODE_TAG.
             single_tracker.add_read(
                 SingleEndKey {
                     library_idx: lib_idx,
+                    barcode_hash: 0,
                     ref_id: tid_i32,
                     unclipped_5prime: uc5,
                     is_reverse,
@@ -278,9 +282,13 @@ pub fn scan_pass(
                         (rev_lo_raw, rev_hi_raw)
                     };
 
+                // A.2 will populate barcode_hash / read1_barcode_hash / read2_barcode_hash.
                 paired_tracker.add_pair(
                     PairedEndKey {
                         library_idx: lib_idx,
+                        barcode_hash: 0,
+                        read1_barcode_hash: 0,
+                        read2_barcode_hash: 0,
                         ref_id_lo: ref_lo, pos_lo, is_reverse_lo: rev_lo,
                         ref_id_hi: ref_hi, pos_hi, is_reverse_hi: rev_hi,
                     },
@@ -292,6 +300,7 @@ pub fn scan_pass(
                 );
                 paired_tracker.resolve_up_to(tid_i32, pos, &mut dup_bits);
             } else {
+                // A.2 will populate barcode_hash / read_barcode_hash from tags.
                 pending.insert(PendingMate {
                     name_hash: nh,
                     check_hash: ch,
@@ -303,6 +312,8 @@ pub fn scan_pass(
                     quality_sum: qsum,
                     record_id: current_id,
                     library_idx: lib_idx,
+                    barcode_hash: 0,
+                    read_barcode_hash: 0,
                 });
             }
         }
