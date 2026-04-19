@@ -143,8 +143,17 @@ when reproducing a bug is required for byte-identical duplicate flags.**
 
 - Multi-threaded Pass 1 / Pass 2 — Phase 4 in tasks.md, deferred.
 - `TAGGING_POLICY` / `DT` tag emission — not used by nf-core/rnaseq.
-- `BARCODE_TAG`, `READ_ONE_BARCODE_TAG`, `READ_TWO_BARCODE_TAG` — UMI
-  handling belongs in `umi_tools`, not MarkDuplicates.
+- `DUPLEX_UMI` — duplex-strand consensus assignment requires
+  `UmiUtil.getStrand`, which depends on the mate's unclipped 5'
+  coordinate via `SAMUtils.getMateUnclippedStart/End` — and that
+  requires the MC tag (mate CIGAR) to be present. markdup-wea does
+  not currently parse MC, and folding DUPLEX_UMI in requires either
+  MC parsing in `src/scan.rs` or restructuring barcode computation
+  to defer until both mates are seen. Single-strand `BARCODE_TAG`
+  / `READ_ONE_BARCODE_TAG` / `READ_TWO_BARCODE_TAG` (the common
+  case) ARE supported as of Track A — see
+  [umi_semantics.md](umi_semantics.md). DUPLEX_UMI is tracked as
+  Track A.7.
 - `MAX_FILE_HANDLES_FOR_READ_ENDS_MAP` and other tuning knobs — we
   use an in-memory BTreeMap with position-keyed incremental
   resolution; no disk spill.

@@ -8,7 +8,9 @@ Picard MarkDuplicates is the 3rd most expensive step in nf-core/rnaseq (~9% runt
 
 **Goal:** Single static Rust binary. Two passes over coordinate-sorted BAM. Drop-in Picard replacement for nf-core. No JVM, no config, no surprises.
 
-**MVP scope:** Paired-end + single-end duplicate detection, Picard-compatible metrics, multi-threaded I/O. **Not in MVP:** optical duplicates (output 0, document), UMI support, queryname-sorted input.
+**MVP scope:** Paired-end + single-end duplicate detection, Picard-compatible metrics, multi-threaded I/O. **Not in MVP:** optical duplicates (output 0, document), DUPLEX_UMI dual-strand consensus, queryname-sorted input.
+
+**Track A (post-MVP, in progress):** UMI / `BARCODE_TAG` support — see [docs/umi_semantics.md](umi_semantics.md) for the full design pinning Picard 3.4.0 semantics. Single-strand UMIs (`BARCODE_TAG`, `READ_ONE_BARCODE_TAG`, `READ_TWO_BARCODE_TAG`, `MOLECULAR_IDENTIFIER_TAG`) land in A.1–A.3; `DUPLEX_UMI` is deferred to A.7 because Picard's `UmiUtil.getStrand` requires MC-tag parsing not currently in markdup-wea.
 
 ## Targets
 
