@@ -2,6 +2,7 @@
 //!
 //! Exposes modules for use from integration tests and downstream consumers.
 
+pub mod barcode_tags;
 pub mod barcodes;
 pub mod dupset;
 pub mod groups;

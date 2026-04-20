@@ -46,7 +46,10 @@ fn validation_compare_passes_on_identical_outputs() {
         .status()
         .unwrap();
 
-    assert!(status.success(), "comparator should succeed on identical files");
+    assert!(
+        status.success(),
+        "comparator should succeed on identical files"
+    );
 
     let json: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(json["passed"], true);
@@ -97,7 +100,10 @@ fn validation_compare_reports_metrics_mismatch() {
         .status()
         .unwrap();
 
-    assert!(!status.success(), "comparator should fail on mismatched metrics");
+    assert!(
+        !status.success(),
+        "comparator should fail on mismatched metrics"
+    );
 
     let json: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(json["passed"], false);

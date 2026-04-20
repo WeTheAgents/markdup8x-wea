@@ -1,5 +1,6 @@
 //! Two-pass orchestrator: scan (Pass 1) → dup_bits → write (Pass 2).
 
+use crate::barcode_tags::BarcodeTags;
 use crate::dupset::DupSet;
 use crate::io;
 use crate::metrics;
@@ -36,6 +37,7 @@ pub fn run(
     threads: u32,
     remove_duplicates: bool,
     assume_sort_order: Option<&str>,
+    barcode_tags: BarcodeTags<'_>,
 ) -> Result<()> {
     let (actual_path, _tmp) = io::resolve_input(input)?;
     let n_threads = (threads as usize).max(1);
@@ -51,10 +53,11 @@ pub fn run(
     io::validate_sort_order(&header, assume_sort_order)?;
 
     info!("Pass 1: scanning for duplicates...");
-    let scan_result = scan::scan_pass(&mut reader, &header)?;
+    let scan_result = scan::scan_pass(&mut reader, &header, barcode_tags)?;
     info!(
         "Pass 1 done: {} records, {} dups",
-        scan_result.total_records, scan_result.dup_bits.len()
+        scan_result.total_records,
+        scan_result.dup_bits.len()
     );
     drop(reader);
 
@@ -176,7 +179,11 @@ pub fn run(
         "Pass 2 done: {} written, {} flagged{}",
         records_written,
         dups_written,
-        if remove_duplicates { format!(", {} removed", dups_written) } else { String::new() }
+        if remove_duplicates {
+            format!(", {} removed", dups_written)
+        } else {
+            String::new()
+        }
     );
 
     Ok(())

@@ -98,12 +98,7 @@ impl PairedGroupTracker {
 
     /// Resolve all groups whose max_pos is <= (ref_id, pos).
     /// Returns number of groups resolved.
-    pub fn resolve_up_to(
-        &mut self,
-        ref_id: i32,
-        pos: i64,
-        dup_bits: &mut dyn DupSet,
-    ) -> usize {
+    pub fn resolve_up_to(&mut self, ref_id: i32, pos: i64, dup_bits: &mut dyn DupSet) -> usize {
         let cutoff = (ref_id, pos);
         let keys_to_resolve: Vec<Vec<PairedEndKey>> = self
             .resolve_at
@@ -112,11 +107,8 @@ impl PairedGroupTracker {
             .collect();
 
         // Remove resolved entries from BTreeMap
-        let positions: Vec<(i32, i64)> = self
-            .resolve_at
-            .range(..=cutoff)
-            .map(|(k, _)| *k)
-            .collect();
+        let positions: Vec<(i32, i64)> =
+            self.resolve_at.range(..=cutoff).map(|(k, _)| *k).collect();
         for p in &positions {
             self.resolve_at.remove(p);
         }
@@ -191,6 +183,16 @@ impl Default for PairedGroupTracker {
 }
 
 /// Inline single-end group tracker. Resolves consecutive groups immediately.
+///
+/// NOTE (A.2): This matches Picard's behavior byte-for-byte on the default-off
+/// (no `BARCODE_TAG`) path, where reads at the same (ref, uc5', strand) share
+/// a single key and arrive in consecutive runs in the coord-sorted stream.
+/// With `BARCODE_TAG` enabled, UMIs can bifurcate keys at the same coord and
+/// interleave, causing this inline tracker to split SE groups Picard would
+/// keep together. For paired-end UMI data (the common case) this is
+/// immaterial — SE groups only arise from orphans/unpaired fragments. This
+/// limitation is documented in `docs/deviations.md` as an A.2 known deviation
+/// and is addressed by the duplex-UMI work in Track A.4+.
 pub struct SingleEndTracker {
     current_key: Option<SingleEndKey>,
     current_group: Vec<ScoredSingle>,
@@ -210,22 +212,17 @@ impl SingleEndTracker {
         }
     }
 
-    /// Add a single-end read. If key differs from current group, resolve the current group first.
+    /// Add a single-end read. If key differs from current group, resolve the
+    /// current group first.
     ///
     /// `reads_examined` counts only real fragments (not paired markers), to
     /// match Picard's `UNPAIRED_READS_EXAMINED` semantics.
-    pub fn add_read(
-        &mut self,
-        key: SingleEndKey,
-        scored: ScoredSingle,
-        dup_bits: &mut dyn DupSet,
-    ) {
+    pub fn add_read(&mut self, key: SingleEndKey, scored: ScoredSingle, dup_bits: &mut dyn DupSet) {
         if !scored.is_paired_marker {
             self.reads_examined += 1;
         }
 
         if self.current_key.as_ref() != Some(&key) {
-            // New group — resolve previous
             self.resolve_current(dup_bits);
             self.current_key = Some(key);
         }
@@ -244,7 +241,6 @@ impl SingleEndTracker {
             return;
         }
 
-        // Histogram counts only real fragments, not paired markers.
         let fragment_count = self
             .current_group
             .iter()
@@ -260,8 +256,6 @@ impl SingleEndTracker {
         let has_paired_marker = self.current_group.iter().any(|s| s.is_paired_marker);
 
         if has_paired_marker {
-            // Picard §4: every real fragment at a locus with any paired-read
-            // presence is unconditionally flagged regardless of score.
             for read in self.current_group.iter() {
                 if !read.is_paired_marker {
                     dup_bits.insert(read.record_id);
@@ -277,12 +271,8 @@ impl SingleEndTracker {
             return;
         }
 
-        // Sort: highest score first, then lowest record_id
-        self.current_group.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then(a.record_id.cmp(&b.record_id))
-        });
+        self.current_group
+            .sort_by(|a, b| b.score.cmp(&a.score).then(a.record_id.cmp(&b.record_id)));
 
         for read in self.current_group.iter().skip(1) {
             dup_bits.insert(read.record_id);
@@ -609,19 +599,33 @@ mod tests {
         // High-score fragment first
         tracker.add_read(
             key.clone(),
-            ScoredSingle { score: 999, record_id: 7, is_paired_marker: false },
+            ScoredSingle {
+                score: 999,
+                record_id: 7,
+                is_paired_marker: false,
+            },
             &mut dup_bits,
         );
         // Then a paired marker (zero score) — marker must still win
         tracker.add_read(
             key,
-            ScoredSingle { score: 0, record_id: 42, is_paired_marker: true },
+            ScoredSingle {
+                score: 0,
+                record_id: 42,
+                is_paired_marker: true,
+            },
             &mut dup_bits,
         );
         tracker.flush(&mut dup_bits);
 
-        assert!(dup_bits.contains(7), "fragment must be flagged when pair present");
-        assert!(!dup_bits.contains(42), "paired marker is not a fragment duplicate");
+        assert!(
+            dup_bits.contains(7),
+            "fragment must be flagged when pair present"
+        );
+        assert!(
+            !dup_bits.contains(42),
+            "paired marker is not a fragment duplicate"
+        );
         assert_eq!(tracker.read_duplicates, 1);
         assert_eq!(tracker.reads_examined, 1); // marker does not count
     }
@@ -640,7 +644,11 @@ mod tests {
         };
         tracker.add_read(
             key,
-            ScoredSingle { score: 0, record_id: 1, is_paired_marker: true },
+            ScoredSingle {
+                score: 0,
+                record_id: 1,
+                is_paired_marker: true,
+            },
             &mut dup_bits,
         );
         tracker.flush(&mut dup_bits);
@@ -667,8 +675,14 @@ mod tests {
 
     #[test]
     fn paired_key_distinct_barcode_hash_separate_groups() {
-        let k1 = PairedEndKey { barcode_hash: 100, ..paired_template() };
-        let k2 = PairedEndKey { barcode_hash: 200, ..paired_template() };
+        let k1 = PairedEndKey {
+            barcode_hash: 100,
+            ..paired_template()
+        };
+        let k2 = PairedEndKey {
+            barcode_hash: 200,
+            ..paired_template()
+        };
         assert_ne!(k1, k2);
     }
 
@@ -676,8 +690,14 @@ mod tests {
     fn paired_key_picard_missing_barcode_default_31_distinct_from_zero() {
         // BARCODE_TAG missing in Picard hashes to 31 (Objects.hash(null)).
         // The "no flag configured" baseline is 0. The two must not collide.
-        let k_missing = PairedEndKey { barcode_hash: 31, ..paired_template() };
-        let k_default = PairedEndKey { barcode_hash: 0, ..paired_template() };
+        let k_missing = PairedEndKey {
+            barcode_hash: 31,
+            ..paired_template()
+        };
+        let k_default = PairedEndKey {
+            barcode_hash: 0,
+            ..paired_template()
+        };
         assert_ne!(k_missing, k_default);
     }
 
@@ -706,7 +726,10 @@ mod tests {
             unclipped_5prime: 1000,
             is_reverse: false,
         };
-        let k2 = SingleEndKey { barcode_hash: 200, ..k1.clone() };
+        let k2 = SingleEndKey {
+            barcode_hash: 200,
+            ..k1.clone()
+        };
         assert_ne!(k1, k2);
     }
 }

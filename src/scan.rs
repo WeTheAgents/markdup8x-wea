@@ -1,5 +1,7 @@
 //! Pass 1: Scan BAM, build duplicate groups, resolve, return dupset.
 
+use crate::barcode_tags::BarcodeTags;
+use crate::barcodes;
 use crate::dupset::BitVecDupSet;
 use crate::groups::{
     PairedEndKey, PairedGroupTracker, ScoredPair, ScoredSingle, SingleEndKey, SingleEndTracker,
@@ -96,6 +98,88 @@ fn extract_read_group(record: &bam::Record) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Look up an arbitrary 2-byte SAM aux tag and return its value as an owned
+/// byte vector. Returns `None` if the tag is absent; errors if present but
+/// not a SAM String (Z/H). Used for BARCODE_TAG / READ_ONE_BARCODE_TAG /
+/// READ_TWO_BARCODE_TAG lookup. Mirrors `extract_read_group`'s copy-out
+/// pattern to sidestep noodles' record-scoped borrow.
+fn lookup_string_tag(record: &bam::Record, tag: &[u8; 2]) -> Result<Option<Vec<u8>>> {
+    use noodles::sam::alignment::record::data::field::{Tag, Value};
+
+    let data = record.data();
+    let value = data
+        .get(&Tag::new(tag[0], tag[1]))
+        .transpose()
+        .with_context(|| {
+            format!(
+                "Failed to decode {} tag",
+                std::str::from_utf8(tag).unwrap_or("??")
+            )
+        })?;
+
+    match value {
+        None => Ok(None),
+        Some(Value::String(s)) => {
+            let bytes: &[u8] = s.as_ref();
+            Ok(Some(bytes.to_vec()))
+        }
+        Some(_) => bail!(
+            "{} tag must be a string",
+            std::str::from_utf8(tag).unwrap_or("??")
+        ),
+    }
+}
+
+/// Compute (barcode_hash, read_barcode_hash) for a single record under the
+/// given `BarcodeTags` config.
+///
+/// **Feature off** (`tags.*` = None) → returns 0. This is how A.1's default-off
+/// byte-parity contract is preserved: never invoke `picard_barcode_hash`
+/// unless the CLI flag is explicitly set (31 ≠ 0 and would diverge).
+///
+/// **Feature on, tag missing on this record** → returns Picard's asymmetric
+/// fallback: 31 for BARCODE_TAG (`Objects.hash(null)` = 31), 0 for READ_ONE/TWO
+/// (bare `String.hashCode` on null → 0). See docs/umi_semantics.md Q1.
+///
+/// **read-one/read-two routing**: `is_first_of_pair` selects which of
+/// `tags.read_one` / `tags.read_two` applies to this record. Picard keys that
+/// routing off the BAM firstOfPair flag, NOT lo/hi coord ordering — see
+/// docs/umi_semantics.md Q5.
+fn extract_barcode_hashes(
+    record: &bam::Record,
+    is_first_of_pair: bool,
+    tags: BarcodeTags<'_>,
+) -> Result<(i32, i32)> {
+    let barcode = if let Some(t) = tags.barcode {
+        let umi = lookup_string_tag(record, t)?;
+        if let Some(u) = umi.as_deref() {
+            barcodes::validate_umi(u).with_context(|| {
+                format!(
+                    "Invalid UMI in {} tag",
+                    std::str::from_utf8(t).unwrap_or("??")
+                )
+            })?;
+        }
+        barcodes::picard_barcode_hash(umi.as_deref())
+    } else {
+        0
+    };
+
+    let which = if is_first_of_pair {
+        tags.read_one
+    } else {
+        tags.read_two
+    };
+    let read_barcode = if let Some(t) = which {
+        let v = lookup_string_tag(record, t)?;
+        barcodes::read_barcode_value(v.as_deref())
+    } else {
+        0
+    };
+
+    Ok((barcode, read_barcode))
+}
+
 pub struct ScanResult {
     pub dup_bits: BitVecDupSet,
     pub counters: MetricsCounters,
@@ -156,6 +240,7 @@ fn extract_mate_alignment_start(record: &bam::Record) -> Result<Option<i64>> {
 pub fn scan_pass(
     reader: &mut crate::io::AlignmentReader,
     header: &sam::Header,
+    barcode_tags: BarcodeTags<'_>,
 ) -> Result<ScanResult> {
     let (rg_to_lib, _lib_names) = build_library_map(header);
 
@@ -206,6 +291,7 @@ pub fn scan_pass(
         let is_paired = flags.is_segmented();
         let mate_unmapped = flags.is_mate_unmapped();
         let is_reverse = flags.is_reverse_complemented();
+        let is_first_of_pair = flags.is_first_segment();
 
         let cigar_ops = extract_cigar_ops(&record)?;
         let uc5 = unclipped_5prime(pos, &cigar_ops, is_reverse);
@@ -215,17 +301,23 @@ pub fn scan_pass(
         let lib_idx = get_library_idx(read_group.as_deref(), &rg_to_lib);
         let tid_i32 = tid.map(|t| t as i32).unwrap_or(-1);
 
+        let (barcode_hash, read_barcode_hash) =
+            extract_barcode_hashes(&record, is_first_of_pair, barcode_tags)?;
+
         if !is_paired || mate_unmapped {
-            // A.2 will populate barcode_hash from BARCODE_TAG.
             single_tracker.add_read(
                 SingleEndKey {
                     library_idx: lib_idx,
-                    barcode_hash: 0,
+                    barcode_hash,
                     ref_id: tid_i32,
                     unclipped_5prime: uc5,
                     is_reverse,
                 },
-                ScoredSingle { score: qsum, record_id: current_id, is_paired_marker: false },
+                ScoredSingle {
+                    score: qsum,
+                    record_id: current_id,
+                    is_paired_marker: false,
+                },
                 &mut dup_bits,
             );
         } else {
@@ -250,25 +342,42 @@ pub fn scan_pass(
             // right now. Marker score=0, record_id=current_id (unused unless
             // something dereferences the Vec entry; the resolve code skips
             // markers before flagging).
-            // A.2 will populate barcode_hash from BARCODE_TAG.
             single_tracker.add_read(
                 SingleEndKey {
                     library_idx: lib_idx,
-                    barcode_hash: 0,
+                    barcode_hash,
                     ref_id: tid_i32,
                     unclipped_5prime: uc5,
                     is_reverse,
                 },
-                ScoredSingle { score: 0, record_id: current_id, is_paired_marker: true },
+                ScoredSingle {
+                    score: 0,
+                    record_id: current_id,
+                    is_paired_marker: true,
+                },
                 &mut dup_bits,
             );
 
             if let Some(mate) = pending.remove(nh, ch) {
                 let (ref_lo, pos_lo, rev_lo_raw, ref_hi, pos_hi, rev_hi_raw) =
                     if (tid_i32, uc5) <= (mate.ref_id, mate.unclipped_5prime) {
-                        (tid_i32, uc5, is_reverse, mate.ref_id, mate.unclipped_5prime, mate.is_reverse)
+                        (
+                            tid_i32,
+                            uc5,
+                            is_reverse,
+                            mate.ref_id,
+                            mate.unclipped_5prime,
+                            mate.is_reverse,
+                        )
                     } else {
-                        (mate.ref_id, mate.unclipped_5prime, mate.is_reverse, tid_i32, uc5, is_reverse)
+                        (
+                            mate.ref_id,
+                            mate.unclipped_5prime,
+                            mate.is_reverse,
+                            tid_i32,
+                            uc5,
+                            is_reverse,
+                        )
                     };
 
                 // Picard same-position RF→FR normalization (MarkDuplicates §3 of research).
@@ -282,15 +391,27 @@ pub fn scan_pass(
                         (rev_lo_raw, rev_hi_raw)
                     };
 
-                // A.2 will populate barcode_hash / read1_barcode_hash / read2_barcode_hash.
+                // BARCODE_TAG: both mates carry the same value per Picard
+                // convention, so either side's hash is equivalent; we use the
+                // current record's. READ_ONE/TWO: assignment is firstOfPair-
+                // flag-driven, NOT lo/hi-coord driven (umi_semantics.md Q5).
+                let (read1_barcode_hash, read2_barcode_hash) = if is_first_of_pair {
+                    (read_barcode_hash, mate.read_barcode_hash)
+                } else {
+                    (mate.read_barcode_hash, read_barcode_hash)
+                };
                 paired_tracker.add_pair(
                     PairedEndKey {
                         library_idx: lib_idx,
-                        barcode_hash: 0,
-                        read1_barcode_hash: 0,
-                        read2_barcode_hash: 0,
-                        ref_id_lo: ref_lo, pos_lo, is_reverse_lo: rev_lo,
-                        ref_id_hi: ref_hi, pos_hi, is_reverse_hi: rev_hi,
+                        barcode_hash,
+                        read1_barcode_hash,
+                        read2_barcode_hash,
+                        ref_id_lo: ref_lo,
+                        pos_lo,
+                        is_reverse_lo: rev_lo,
+                        ref_id_hi: ref_hi,
+                        pos_hi,
+                        is_reverse_hi: rev_hi,
                     },
                     ScoredPair {
                         combined_score: qsum + mate.quality_sum,
@@ -300,7 +421,6 @@ pub fn scan_pass(
                 );
                 paired_tracker.resolve_up_to(tid_i32, pos, &mut dup_bits);
             } else {
-                // A.2 will populate barcode_hash / read_barcode_hash from tags.
                 pending.insert(PendingMate {
                     name_hash: nh,
                     check_hash: ch,
@@ -312,8 +432,9 @@ pub fn scan_pass(
                     quality_sum: qsum,
                     record_id: current_id,
                     library_idx: lib_idx,
-                    barcode_hash: 0,
-                    read_barcode_hash: 0,
+                    barcode_hash,
+                    read_barcode_hash,
+                    is_first_of_pair,
                 });
             }
         }
@@ -341,11 +462,15 @@ pub fn scan_pass(
 
     info!(
         "Pass 1: {} records, {} pair dups, {} single dups, peak pending {}",
-        record_id, counters.read_pair_duplicates, counters.unpaired_read_duplicates, pending.peak()
+        record_id,
+        counters.read_pair_duplicates,
+        counters.unpaired_read_duplicates,
+        pending.peak()
     );
 
     Ok(ScanResult {
-        dup_bits, counters,
+        dup_bits,
+        counters,
         total_records: record_id,
         pending_peak: pending.peak(),
     })

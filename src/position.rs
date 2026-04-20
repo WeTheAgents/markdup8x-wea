@@ -17,8 +17,11 @@ pub fn unclipped_5prime(pos: i64, cigar_ops: &[(Kind, usize)], is_reverse: bool)
         let mut end = pos;
         for &(kind, len) in cigar_ops {
             match kind {
-                Kind::Match | Kind::Deletion | Kind::Skip
-                | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                Kind::Match
+                | Kind::Deletion
+                | Kind::Skip
+                | Kind::SequenceMatch
+                | Kind::SequenceMismatch => {
                     end += len as i64;
                 }
                 _ => {}

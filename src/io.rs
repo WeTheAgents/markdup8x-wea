@@ -65,7 +65,10 @@ pub fn resolve_input(path: &str) -> Result<(String, Option<NamedTempFile>)> {
 pub fn validate_sort_order(header: &sam::Header, assume_sort_order: Option<&str>) -> Result<()> {
     if let Some(assumed) = assume_sort_order {
         if assumed != "coordinate" {
-            bail!("Only coordinate sort order is supported, got --assume-sort-order {}", assumed);
+            bail!(
+                "Only coordinate sort order is supported, got --assume-sort-order {}",
+                assumed
+            );
         }
         return Ok(());
     }
@@ -94,7 +97,12 @@ pub struct SortOrderEnforcer {
 
 impl SortOrderEnforcer {
     pub fn new() -> Self {
-        Self { seen_any: false, seen_unmapped_tail: false, prev_tid: None, prev_pos: -1 }
+        Self {
+            seen_any: false,
+            seen_unmapped_tail: false,
+            prev_tid: None,
+            prev_pos: -1,
+        }
     }
 
     pub fn check(&mut self, tid: Option<usize>, pos: i64) -> Result<()> {

@@ -88,9 +88,7 @@ pub fn estimate_library_size(pairs_examined: u64, pair_duplicates: u64) -> Optio
     //   n / library_size = n / (x * c) = read_pairs / (x * unique_read_pairs)
     //   f = 1/x - 1 + exp(-n / library_size)
     // Root of f defines library_size; we search for x in [1, 100] growing upward.
-    let f = |x: f64| -> f64 {
-        1.0 / x - 1.0 + (-read_pairs / (x * unique_read_pairs)).exp()
-    };
+    let f = |x: f64| -> f64 { 1.0 / x - 1.0 + (-read_pairs / (x * unique_read_pairs)).exp() };
 
     let mut m: f64 = 1.0;
     let mut big_m: f64 = 100.0;
@@ -133,12 +131,13 @@ pub fn write_metrics(
     input_path: &str,
     output_path: &str,
 ) -> Result<()> {
-    let mut f =
-        std::fs::File::create(path).with_context(|| format!("Failed to create metrics: {}", path))?;
+    let mut f = std::fs::File::create(path)
+        .with_context(|| format!("Failed to create metrics: {}", path))?;
 
     let version = env!("CARGO_PKG_VERSION");
     let pct = percent_duplication(counters);
-    let est_opt = estimate_library_size(counters.read_pairs_examined, counters.read_pair_duplicates);
+    let est_opt =
+        estimate_library_size(counters.read_pairs_examined, counters.read_pair_duplicates);
     // Picard writes an empty field (no value after the TAB) when the estimate is null.
     let est_str = est_opt.map(|v| v.to_string()).unwrap_or_default();
 
@@ -330,9 +329,17 @@ mod tests {
     fn library_size_normal_estimate_is_plausible() {
         // 90481 pairs observed, 11688 dups → ~78793 unique. Library must be larger than unique.
         let est = estimate_library_size(90481, 11688).expect("defined estimate");
-        assert!(est > 78793, "library size {} should exceed unique count", est);
+        assert!(
+            est > 78793,
+            "library size {} should exceed unique count",
+            est
+        );
         // Sanity: for ~13% dup rate the library is finite and not absurd.
-        assert!(est < 10_000_000, "library size {} is implausibly large", est);
+        assert!(
+            est < 10_000_000,
+            "library size {} is implausibly large",
+            est
+        );
     }
 
     #[test]
@@ -368,8 +375,14 @@ mod tests {
         // Check critical MultiQC header
         assert!(content.contains("## METRICS CLASS\tpicard.sam.DuplicationMetrics"));
         // Picard preamble structural parity: TWO StringHeader sections
-        let n_headers = content.matches("## htsjdk.samtools.metrics.StringHeader").count();
-        assert_eq!(n_headers, 2, "expected 2 StringHeader sections (Picard parity), got {}", n_headers);
+        let n_headers = content
+            .matches("## htsjdk.samtools.metrics.StringHeader")
+            .count();
+        assert_eq!(
+            n_headers, 2,
+            "expected 2 StringHeader sections (Picard parity), got {}",
+            n_headers
+        );
         // Block 1: command-line provenance (we identify ourselves honestly)
         assert!(content.contains("# markdup-wea "));
         // Block 2: "Started on" timestamp in Picard format ("EEE MMM dd HH:MM:SS GMT YYYY")
@@ -377,15 +390,51 @@ mod tests {
             .lines()
             .find(|l| l.starts_with("# Started on: "))
             .expect("missing '# Started on:' line");
-        let parts: Vec<&str> = started_line["# Started on: ".len()..].split_whitespace().collect();
+        let parts: Vec<&str> = started_line["# Started on: ".len()..]
+            .split_whitespace()
+            .collect();
         // Expected fields: [weekday, month, day, "HH:MM:SS", "GMT", year]
-        assert_eq!(parts.len(), 6, "Picard date should have 6 space-separated tokens, got {:?}", parts);
-        assert_eq!(parts[0].len(), 3, "weekday should be 3-char abbrev, got {:?}", parts[0]);
-        assert_eq!(parts[1].len(), 3, "month should be 3-char abbrev, got {:?}", parts[1]);
-        assert_eq!(parts[2].len(), 2, "day should be 2-char zero-padded, got {:?}", parts[2]);
-        assert_eq!(parts[3].len(), 8, "time should be HH:MM:SS, got {:?}", parts[3]);
-        assert_eq!(parts[4], "UTC", "expected literal UTC zone, got {:?}", parts[4]);
-        assert_eq!(parts[5].len(), 4, "year should be 4 digits, got {:?}", parts[5]);
+        assert_eq!(
+            parts.len(),
+            6,
+            "Picard date should have 6 space-separated tokens, got {:?}",
+            parts
+        );
+        assert_eq!(
+            parts[0].len(),
+            3,
+            "weekday should be 3-char abbrev, got {:?}",
+            parts[0]
+        );
+        assert_eq!(
+            parts[1].len(),
+            3,
+            "month should be 3-char abbrev, got {:?}",
+            parts[1]
+        );
+        assert_eq!(
+            parts[2].len(),
+            2,
+            "day should be 2-char zero-padded, got {:?}",
+            parts[2]
+        );
+        assert_eq!(
+            parts[3].len(),
+            8,
+            "time should be HH:MM:SS, got {:?}",
+            parts[3]
+        );
+        assert_eq!(
+            parts[4], "UTC",
+            "expected literal UTC zone, got {:?}",
+            parts[4]
+        );
+        assert_eq!(
+            parts[5].len(),
+            4,
+            "year should be 4 digits, got {:?}",
+            parts[5]
+        );
         // Check column headers
         assert!(content.contains("LIBRARY\tUNPAIRED_READS_EXAMINED"));
         // Check 4-column Picard histogram format

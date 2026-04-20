@@ -76,6 +76,8 @@ pub struct ReadSpec {
     pub rg: Option<&'static str>,
     /// Optional DT tag value for output-side fidelity tests.
     pub dt: Option<&'static str>,
+    /// Arbitrary 2-byte SAM aux string tags (e.g. RX for barcode tests).
+    pub aux_tags: Vec<([u8; 2], &'static [u8])>,
 }
 
 impl Default for ReadSpec {
@@ -94,6 +96,7 @@ impl Default for ReadSpec {
             qual: Vec::new(),
             rg: None,
             dt: None,
+            aux_tags: Vec::new(),
         }
     }
 }
@@ -105,6 +108,7 @@ pub struct BamBuilder {
     read_groups: Vec<(String, String)>, // (id, library_name)
     reads: Vec<ReadSpec>,
     override_sort_order: Option<String>,
+    coord_sort: bool,
 }
 
 impl BamBuilder {
@@ -114,7 +118,17 @@ impl BamBuilder {
             read_groups: Vec::new(),
             reads: Vec::new(),
             override_sort_order: None,
+            coord_sort: false,
         }
+    }
+
+    /// Opt-in: stably sort records by (ref_id, pos) before writing. Use when
+    /// adding multiple pairs at interleaving coordinates where manual ordering
+    /// would be tedious. Tests that deliberately emit an unsorted BAM (B16)
+    /// must NOT call this.
+    pub fn coord_sort(mut self) -> Self {
+        self.coord_sort = true;
+        self
     }
 
     /// Add a reference sequence (@SQ).
@@ -157,22 +171,35 @@ impl BamBuilder {
     pub fn add_pair(mut self, mut r1: ReadSpec, mut r2: ReadSpec) -> Self {
         r1.flags |= 0x1 | 0x40; // paired, first-in-pair
         r2.flags |= 0x1 | 0x80; // paired, second-in-pair
-        // Cross-link mate positions if not already set.
-        if r1.mate_ref_name.is_none() { r1.mate_ref_name = r2.ref_name; }
-        if r1.mate_pos.is_none() { r1.mate_pos = r2.pos; }
-        if r2.mate_ref_name.is_none() { r2.mate_ref_name = r1.ref_name; }
-        if r2.mate_pos.is_none() { r2.mate_pos = r1.pos; }
+                                // Cross-link mate positions if not already set.
+        if r1.mate_ref_name.is_none() {
+            r1.mate_ref_name = r2.ref_name;
+        }
+        if r1.mate_pos.is_none() {
+            r1.mate_pos = r2.pos;
+        }
+        if r2.mate_ref_name.is_none() {
+            r2.mate_ref_name = r1.ref_name;
+        }
+        if r2.mate_pos.is_none() {
+            r2.mate_pos = r1.pos;
+        }
         // Mate-reverse flag derived from partner's reverse flag.
-        if r2.flags & 0x10 != 0 { r1.flags |= 0x20; }
-        if r1.flags & 0x10 != 0 { r2.flags |= 0x20; }
+        if r2.flags & 0x10 != 0 {
+            r1.flags |= 0x20;
+        }
+        if r1.flags & 0x10 != 0 {
+            r2.flags |= 0x20;
+        }
         self.reads.push(r1);
         self.reads.push(r2);
         self
     }
 
-    /// Write the assembled BAM to `path`. Reads are written in the order added;
-    /// caller is responsible for coordinate ordering.
-    pub fn write(self, path: &Path) -> anyhow::Result<()> {
+    /// Write the assembled BAM to `path`. Records are stably sorted by
+    /// (ref_id, pos) so callers can add pairs in any order and still produce
+    /// a coordinate-sorted BAM. Unmapped reads (no pos) sort to the end.
+    pub fn write(mut self, path: &Path) -> anyhow::Result<()> {
         let header = self.build_header()?;
         let ref_name_to_id: HashMap<String, usize> = self
             .refs
@@ -180,6 +207,18 @@ impl BamBuilder {
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i))
             .collect();
+
+        if self.coord_sort {
+            let sort_key = |spec: &ReadSpec| -> (i64, i64) {
+                let tid = spec
+                    .ref_name
+                    .and_then(|n| ref_name_to_id.get(n).map(|&i| i as i64))
+                    .unwrap_or(i64::MAX);
+                let pos = spec.pos.map(|p| p as i64).unwrap_or(i64::MAX);
+                (tid, pos)
+            };
+            self.reads.sort_by_key(sort_key);
+        }
 
         let file = File::create(path)?;
         // bam::io::Writer::new wraps in BGZF; Writer::from does NOT (important!).
@@ -208,14 +247,16 @@ impl BamBuilder {
         for (name, length) in &self.refs {
             let len = NonZeroUsize::new(*length)
                 .ok_or_else(|| anyhow::anyhow!("reference length must be > 0"))?;
-            builder = builder.add_reference_sequence(name.clone(), Map::<ReferenceSequence>::new(len));
+            builder =
+                builder.add_reference_sequence(name.clone(), Map::<ReferenceSequence>::new(len));
         }
 
         for (id, lib) in &self.read_groups {
             let mut rg = Map::<ReadGroup>::default();
             // Empty library string = sentinel from `read_group_no_lb`: omit the LB tag.
             if !lib.is_empty() {
-                rg.other_fields_mut().insert(LIBRARY, BString::from(lib.as_str()));
+                rg.other_fields_mut()
+                    .insert(LIBRARY, BString::from(lib.as_str()));
             }
             builder = builder.add_read_group(id.clone(), rg);
         }
@@ -291,6 +332,15 @@ fn build_record(spec: &ReadSpec, ref_map: &HashMap<String, usize>) -> anyhow::Re
             .insert(Tag::new(b'D', b'T'), Value::String(BString::from(dt)));
     }
 
+    for (tag, value) in &spec.aux_tags {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        record.data_mut().insert(
+            Tag::new(tag[0], tag[1]),
+            Value::String(BString::from(*value)),
+        );
+    }
+
     Ok(record)
 }
 
@@ -325,11 +375,16 @@ fn cigar_query_len(cigar: &Cigar) -> usize {
     cigar
         .as_ref()
         .iter()
-        .filter(|op| matches!(
-            op.kind(),
-            Kind::Match | Kind::Insertion | Kind::SoftClip
-                | Kind::SequenceMatch | Kind::SequenceMismatch
-        ))
+        .filter(|op| {
+            matches!(
+                op.kind(),
+                Kind::Match
+                    | Kind::Insertion
+                    | Kind::SoftClip
+                    | Kind::SequenceMatch
+                    | Kind::SequenceMismatch
+            )
+        })
         .map(|op| op.len())
         .sum()
 }
@@ -418,15 +473,12 @@ pub fn run_markdup(input: &Path, output: &Path) -> anyhow::Result<()> {
         1,
         false,
         None,
+        markdup_wea::barcode_tags::BarcodeTags::default(),
     )
 }
 
 /// Like `run_markdup` but also writes a Picard-format metrics file.
-pub fn run_markdup_with_metrics(
-    input: &Path,
-    output: &Path,
-    metrics: &Path,
-) -> anyhow::Result<()> {
+pub fn run_markdup_with_metrics(input: &Path, output: &Path, metrics: &Path) -> anyhow::Result<()> {
     markdup_wea::markdup::run(
         input.to_str().unwrap(),
         Some(output.to_str().unwrap()),
@@ -434,6 +486,28 @@ pub fn run_markdup_with_metrics(
         1,
         false,
         None,
+        markdup_wea::barcode_tags::BarcodeTags::default(),
+    )
+}
+
+/// Run markdup-wea with a `--barcode-tag` (BARCODE_TAG) set.
+pub fn run_markdup_with_barcode_tag(
+    input: &Path,
+    output: &Path,
+    barcode_tag: &[u8; 2],
+) -> anyhow::Result<()> {
+    markdup_wea::markdup::run(
+        input.to_str().unwrap(),
+        Some(output.to_str().unwrap()),
+        None,
+        1,
+        false,
+        None,
+        markdup_wea::barcode_tags::BarcodeTags {
+            barcode: Some(barcode_tag),
+            read_one: None,
+            read_two: None,
+        },
     )
 }
 
@@ -502,10 +576,7 @@ pub fn parse_metrics(path: &Path) -> anyhow::Result<Vec<MetricsRecord>> {
             library: f.get(i_lib).copied().unwrap_or("").to_string(),
             unpaired_reads_examined: f.get(i_uex).and_then(|v| v.parse().ok()).unwrap_or(0),
             read_pairs_examined: f.get(i_rpx).and_then(|v| v.parse().ok()).unwrap_or(0),
-            secondary_or_supplementary_rds: f
-                .get(i_sos)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+            secondary_or_supplementary_rds: f.get(i_sos).and_then(|v| v.parse().ok()).unwrap_or(0),
             unmapped_reads: f.get(i_unm).and_then(|v| v.parse().ok()).unwrap_or(0),
             unpaired_read_duplicates: f.get(i_urd).and_then(|v| v.parse().ok()).unwrap_or(0),
             read_pair_duplicates: f.get(i_rpd).and_then(|v| v.parse().ok()).unwrap_or(0),

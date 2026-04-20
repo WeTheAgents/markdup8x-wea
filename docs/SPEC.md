@@ -10,7 +10,7 @@ Picard MarkDuplicates is the 3rd most expensive step in nf-core/rnaseq (~9% runt
 
 **MVP scope:** Paired-end + single-end duplicate detection, Picard-compatible metrics, multi-threaded I/O. **Not in MVP:** optical duplicates (output 0, document), DUPLEX_UMI dual-strand consensus, queryname-sorted input.
 
-**Track A (post-MVP, in progress):** UMI / `BARCODE_TAG` support — see [docs/umi_semantics.md](umi_semantics.md) for the full design pinning Picard 3.4.0 semantics. Single-strand UMIs (`BARCODE_TAG`, `READ_ONE_BARCODE_TAG`, `READ_TWO_BARCODE_TAG`, `MOLECULAR_IDENTIFIER_TAG`) land in A.1–A.3; `DUPLEX_UMI` is deferred to A.7 because Picard's `UmiUtil.getStrand` requires MC-tag parsing not currently in markdup-wea.
+**Track A (post-MVP, in progress):** UMI / `BARCODE_TAG` support — see [docs/umi_semantics.md](umi_semantics.md) for the full design pinning Picard 3.4.0 semantics. Single-strand UMIs (`BARCODE_TAG`, `READ_ONE_BARCODE_TAG`, `READ_TWO_BARCODE_TAG`, `MOLECULAR_IDENTIFIER_TAG`) land in A.1–A.3; `DUPLEX_UMI` is deferred to A.7 because Picard's `UmiUtil.getStrand` requires MC-tag parsing not currently in markdup-wea. A.2 ships the CLI flags + hash primitives (semantically correct, byte-parity on default-off path preserved); full byte-parity with Picard on UMI-enabled runs is scheduled for A.4 — see [deviations.md §8](deviations.md) for the ~2.8% same-coord-UMI-interleaving edge case.
 
 ## Targets
 

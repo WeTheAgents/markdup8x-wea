@@ -25,6 +25,10 @@ pub struct PendingMate {
     /// which one depends on the firstOfPair flag at pair-completion time.
     /// 0 when the feature is off.
     pub read_barcode_hash: i32,
+    /// BAM flag 0x40 (firstOfPair) captured at insert time. The arriving
+    /// mate uses this to route `read_barcode_hash` into the PairedEndKey's
+    /// read1/read2 slot — assignment is flag-driven, NOT lo/hi-coord.
+    pub is_first_of_pair: bool,
 }
 
 /// Compute 64-bit FxHash of a mate-lookup key.
@@ -142,6 +146,7 @@ mod tests {
             library_idx: 0,
             barcode_hash: 0,
             read_barcode_hash: 0,
+            is_first_of_pair: false,
         }
     }
 
@@ -214,6 +219,18 @@ mod tests {
         let found2 = buf.remove(m2.name_hash, m2.check_hash);
         assert!(found2.is_some());
         assert_eq!(found2.unwrap().record_id, 1);
+    }
+
+    #[test]
+    fn insert_preserves_is_first_of_pair() {
+        let mut buf = PendingMateBuffer::new();
+        let mut m = make_pending(b"R1", Some(b"rg1"), 0);
+        m.is_first_of_pair = true;
+        let nh = m.name_hash;
+        let ch = m.check_hash;
+        buf.insert(m);
+        let got = buf.remove(nh, ch).unwrap();
+        assert!(got.is_first_of_pair);
     }
 
     #[test]

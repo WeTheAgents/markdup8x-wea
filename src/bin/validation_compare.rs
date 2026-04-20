@@ -85,19 +85,28 @@ fn compare(cli: &Cli) -> Result<ComparisonResult> {
             .expected_metrics
             .as_ref()
             .map(|path| path.display().to_string()),
-        actual_metrics: cli.actual_metrics.as_ref().map(|path| path.display().to_string()),
+        actual_metrics: cli
+            .actual_metrics
+            .as_ref()
+            .map(|path| path.display().to_string()),
         records_compared: 0,
         mismatch: None,
     };
 
-    let bam_mismatch = compare_bams(&cli.expected_bam, &cli.actual_bam, &mut result.records_compared)?;
+    let bam_mismatch = compare_bams(
+        &cli.expected_bam,
+        &cli.actual_bam,
+        &mut result.records_compared,
+    )?;
     if let Some(mismatch) = bam_mismatch {
         result.passed = false;
         result.mismatch = Some(mismatch);
         return Ok(result);
     }
 
-    if let (Some(expected_metrics), Some(actual_metrics)) = (&cli.expected_metrics, &cli.actual_metrics) {
+    if let (Some(expected_metrics), Some(actual_metrics)) =
+        (&cli.expected_metrics, &cli.actual_metrics)
+    {
         if let Some(mismatch) = compare_metrics(expected_metrics, actual_metrics)? {
             result.passed = false;
             result.mismatch = Some(mismatch);
@@ -147,8 +156,16 @@ fn compare_bams(
                 class: "record_count".to_string(),
                 record_index: Some(index),
                 field: None,
-                expected: Some(if expected_len == 0 { "EOF".to_string() } else { "record".to_string() }),
-                actual: Some(if actual_len == 0 { "EOF".to_string() } else { "record".to_string() }),
+                expected: Some(if expected_len == 0 {
+                    "EOF".to_string()
+                } else {
+                    "record".to_string()
+                }),
+                actual: Some(if actual_len == 0 {
+                    "EOF".to_string()
+                } else {
+                    "record".to_string()
+                }),
                 details: Some("One BAM ended before the other".to_string()),
             }));
         }
@@ -177,8 +194,22 @@ fn compare_record(index: u64, expected: &RecordBuf, actual: &RecordBuf) -> Optio
                 actual.reference_sequence_id(),
             )
         })
-        .or_else(|| compare_field(index, "alignment_start", expected.alignment_start(), actual.alignment_start()))
-        .or_else(|| compare_field(index, "mapping_quality", expected.mapping_quality(), actual.mapping_quality()))
+        .or_else(|| {
+            compare_field(
+                index,
+                "alignment_start",
+                expected.alignment_start(),
+                actual.alignment_start(),
+            )
+        })
+        .or_else(|| {
+            compare_field(
+                index,
+                "mapping_quality",
+                expected.mapping_quality(),
+                actual.mapping_quality(),
+            )
+        })
         .or_else(|| compare_field(index, "cigar", expected.cigar(), actual.cigar()))
         .or_else(|| {
             compare_field(
@@ -196,9 +227,23 @@ fn compare_record(index: u64, expected: &RecordBuf, actual: &RecordBuf) -> Optio
                 actual.mate_alignment_start(),
             )
         })
-        .or_else(|| compare_field(index, "template_length", expected.template_length(), actual.template_length()))
+        .or_else(|| {
+            compare_field(
+                index,
+                "template_length",
+                expected.template_length(),
+                actual.template_length(),
+            )
+        })
         .or_else(|| compare_field(index, "sequence", expected.sequence(), actual.sequence()))
-        .or_else(|| compare_field(index, "quality_scores", expected.quality_scores(), actual.quality_scores()))
+        .or_else(|| {
+            compare_field(
+                index,
+                "quality_scores",
+                expected.quality_scores(),
+                actual.quality_scores(),
+            )
+        })
         .or_else(|| compare_field(index, "aux", expected.data(), actual.data()))
 }
 
@@ -257,7 +302,8 @@ fn compare_metrics(expected_path: &PathBuf, actual_path: &PathBuf) -> Result<Opt
 }
 
 fn open_bam(path: &PathBuf) -> Result<(bam::io::Reader<bgzf::Reader<File>>, sam::Header)> {
-    let file = File::open(path).with_context(|| format!("Failed to open BAM {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open BAM {}", path.display()))?;
     let mut reader = bam::io::Reader::new(file);
     let header = reader
         .read_header()

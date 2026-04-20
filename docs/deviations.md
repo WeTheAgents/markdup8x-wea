@@ -125,7 +125,39 @@ when reproducing a bug is required for byte-identical duplicate flags.**
   fragment-only false positives, inspect whether those positions
   harbor orphans in the input.
 
-### 8. `estimate_library_size` bail-out when unique ≥ total pairs
+### 8. `BARCODE_TAG` / `READ_ONE_BARCODE_TAG` / `READ_TWO_BARCODE_TAG` — semantically correct, not byte-identical on large datasets
+
+- **Picard (3.4.0):** Pre-sorts all reads by `ReadEndsMDComparator` (keyed
+  on unclipped 5'-most coord + strand + barcode hash) before dup detection.
+  Stable-sort within tied keys preserves coord-sort order.
+- **Ours:** Streams the coordinate-sorted input record-by-record; single-end
+  group resolution is inline ("flush on key change"), which produces
+  Picard-identical output when all reads at a locus share the same key
+  (the default-off case, verified byte-identical on K562_REP1 and on the
+  truseq arm of GSE75823). With `BARCODE_TAG` enabled, reads at the same
+  `(ref, unclipped_5', strand)` locus can carry DIFFERENT UMIs and
+  interleave in the coord-sorted stream, causing our inline tracker to
+  split some groups that Picard's pre-sorted path keeps together.
+- **Why:** A coordinate-sorted streaming pass avoids Picard's
+  spill-to-disk sort and saves both memory and I/O. Matching Picard's
+  byte output under `BARCODE_TAG` requires either an upstream pre-sort
+  pass or a windowed multi-group buffer; both are architectural
+  changes scheduled for Track A.4+.
+- **Impact (measured on GSE75823 UMI arm, ~90M records):** ~2.8% of
+  records differ in the 0x400 flag — all are Picard-flagged duplicates
+  that wea leaves unflagged (i.e. wea under-flags; no false positives).
+  The hash primitives (`Objects.hash` / `String.hashCode`) are
+  bit-identical to Picard and are unit-tested. Paired-end duplicate
+  pairs with matching UMIs at matching coords ARE correctly flagged;
+  the divergence is localized to same-coord UMI-interleaving edge
+  cases, predominantly in single-end / orphan fragments.
+- **Detection:** when byte parity with Picard on UMI inputs is required,
+  pre-sort with `picard SortSam SORT_ORDER=coordinate` (which is
+  already a no-op for input) — the divergence persists because the
+  issue is on the dup-detection sort, not the input sort. The real
+  fix is Track A.4.
+
+### 9. `estimate_library_size` bail-out when unique ≥ total pairs
 
 - **Picard:** Throws `IllegalStateException`, bubbling up as a fatal
   error.
@@ -168,7 +200,7 @@ Picard in your pipeline, the acceptance test is:
 
 1. Entries 1–6 (intentional) — read and confirm the rationale applies
    to your data.
-2. Entries 7–8 (approximations) — confirm the impact bounds are
+2. Entries 7–9 (approximations) — confirm the impact bounds are
    acceptable for your workflow.
 3. Phase C byte-diff against Picard on a representative sample of
    your own data — the ultimate ground-truth test. See `BENCHMARK.md`

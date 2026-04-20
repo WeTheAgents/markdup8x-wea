@@ -1027,7 +1027,12 @@ fn b12_all_duplicates_metric_not_panicking() {
     run_markdup_with_metrics(&input, &output, &metrics).unwrap();
 
     let dups = dup_qnames_set(&output);
-    assert_eq!(dups.len(), 3, "4 identical pairs → 3 duplicates, got {:?}", dups);
+    assert_eq!(
+        dups.len(),
+        3,
+        "4 identical pairs → 3 duplicates, got {:?}",
+        dups
+    );
 
     let recs = parse_metrics(&metrics).unwrap();
     assert_eq!(recs[0].read_pair_duplicates, 3);
@@ -1075,10 +1080,17 @@ fn b13_zero_pairs_metric_produces_valid_file() {
     run_markdup_with_metrics(&input, &output, &metrics).unwrap();
 
     let dups = dup_qnames_set(&output);
-    assert!(dups.is_empty(), "distinct positions → no dups, got {:?}", dups);
+    assert!(
+        dups.is_empty(),
+        "distinct positions → no dups, got {:?}",
+        dups
+    );
 
     let recs = parse_metrics(&metrics).unwrap();
-    assert_eq!(recs[0].unpaired_reads_examined, 3, "A5: orphan counter = 3 SE reads");
+    assert_eq!(
+        recs[0].unpaired_reads_examined, 3,
+        "A5: orphan counter = 3 SE reads"
+    );
     assert_eq!(recs[0].read_pairs_examined, 0);
     assert_eq!(recs[0].read_pair_duplicates, 0);
     assert_eq!(recs[0].percent_duplication, 0.0);
@@ -1155,7 +1167,11 @@ fn b15_stale_dt_tag_is_cleared() {
     run_markdup(&input, &output).unwrap();
 
     let tags = read_string_tag_by_qname(&output, *b"DT");
-    assert_eq!(tags["dt"], vec![None], "stale DT tag must be removed from output");
+    assert_eq!(
+        tags["dt"],
+        vec![None],
+        "stale DT tag must be removed from output"
+    );
 }
 
 // =============================================================================
