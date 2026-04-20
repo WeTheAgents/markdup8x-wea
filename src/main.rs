@@ -48,6 +48,13 @@ struct Cli {
     /// (Picard `READ_TWO_BARCODE_TAG`). 2-char SAM aux tag.
     #[arg(long, value_parser = parse_aux_tag)]
     read_two_barcode_tag: Option<String>,
+
+    /// MOLECULAR_IDENTIFIER_TAG — emit a per-record SAM aux tag naming the
+    /// molecule (Picard `MOLECULAR_IDENTIFIER_TAG`). Value format is
+    /// `{contig}:{pos}/`. Requires `--barcode-tag` to be set (matches
+    /// Picard's `customCommandLineValidation`).
+    #[arg(long, value_parser = parse_aux_tag)]
+    molecular_identifier_tag: Option<String>,
 }
 
 /// Validate a SAM aux tag identifier. Per SAMv1 §1.5, tags match
@@ -88,14 +95,24 @@ fn main() -> Result<()> {
         cli.threads
     );
 
+    // Cross-flag validation: MI requires BARCODE_TAG (Picard:405).
+    if cli.molecular_identifier_tag.is_some() && cli.barcode_tag.is_none() {
+        anyhow::bail!(
+            "--molecular-identifier-tag requires --barcode-tag to be set \
+             (matches Picard's customCommandLineValidation)"
+        );
+    }
+
     // Own the 2-byte tag arrays for the whole run; `BarcodeTags` borrows them.
     let barcode_bytes = cli.barcode_tag.as_deref().map(to_tag_bytes);
     let read_one_bytes = cli.read_one_barcode_tag.as_deref().map(to_tag_bytes);
     let read_two_bytes = cli.read_two_barcode_tag.as_deref().map(to_tag_bytes);
+    let mi_bytes = cli.molecular_identifier_tag.as_deref().map(to_tag_bytes);
     let barcode_tags = BarcodeTags {
         barcode: barcode_bytes.as_ref(),
         read_one: read_one_bytes.as_ref(),
         read_two: read_two_bytes.as_ref(),
+        mi: mi_bytes.as_ref(),
     };
 
     markdup::run(

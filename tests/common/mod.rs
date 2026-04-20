@@ -505,8 +505,29 @@ pub fn run_markdup_with_barcode_tag(
         None,
         markdup_wea::barcode_tags::BarcodeTags {
             barcode: Some(barcode_tag),
-            read_one: None,
-            read_two: None,
+            ..Default::default()
+        },
+    )
+}
+
+/// Run markdup-wea with both `--barcode-tag` and `--molecular-identifier-tag`.
+pub fn run_markdup_with_mi_tag(
+    input: &Path,
+    output: &Path,
+    barcode_tag: &[u8; 2],
+    mi_tag: &[u8; 2],
+) -> anyhow::Result<()> {
+    markdup_wea::markdup::run(
+        input.to_str().unwrap(),
+        Some(output.to_str().unwrap()),
+        None,
+        1,
+        false,
+        None,
+        markdup_wea::barcode_tags::BarcodeTags {
+            barcode: Some(barcode_tag),
+            mi: Some(mi_tag),
+            ..Default::default()
         },
     )
 }

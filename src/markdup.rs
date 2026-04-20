@@ -1,6 +1,6 @@
 //! Two-pass orchestrator: scan (Pass 1) → dup_bits → write (Pass 2).
 
-use crate::barcode_tags::BarcodeTags;
+use crate::barcode_tags::{format_mi_value, BarcodeTags};
 use crate::dupset::DupSet;
 use crate::io;
 use crate::metrics;
@@ -141,6 +141,14 @@ pub fn run(
     let mut dups_written: u64 = 0;
     let mut records_written: u64 = 0;
 
+    // MI emission is gated on BOTH --molecular-identifier-tag AND --barcode-tag
+    // being set (Picard MarkDuplicates.java:404-407). The CLI layer already
+    // rejects MI-without-barcode; this `&&` is defense-in-depth.
+    let mi_tag: Option<[u8; 2]> = match (barcode_tags.mi, barcode_tags.barcode) {
+        (Some(t), Some(_)) => Some(*t),
+        _ => None,
+    };
+
     while reader2.read_record(&mut record)? > 0 {
         let is_dup = scan_result.dup_bits.contains(record_id);
 
@@ -152,6 +160,35 @@ pub fn run(
             Tag::new(b'P', b'G'),
             Value::String(BString::from("MarkDuplicates")),
         );
+
+        if let Some(tag_bytes) = mi_tag {
+            let flags_u16 = u16::from(rec_buf.flags());
+            let is_reverse = flags_u16 & 0x10 != 0;
+            let contig_name: Option<String> = rec_buf.reference_sequence_id().and_then(|idx| {
+                header2
+                    .reference_sequences()
+                    .get_index(idx)
+                    .map(|(name, _)| name.to_string())
+            });
+            // Picard's pair-representative position: reverse → this record's
+            // alignment_start; forward → its mate's alignment_start. 1-based.
+            let pos_1based: i64 = if is_reverse {
+                rec_buf
+                    .alignment_start()
+                    .map(|p| usize::from(p) as i64)
+                    .unwrap_or(0)
+            } else {
+                rec_buf
+                    .mate_alignment_start()
+                    .map(|p| usize::from(p) as i64)
+                    .unwrap_or(0)
+            };
+            let mi_value = format_mi_value(contig_name.as_deref(), is_reverse, pos_1based);
+            rec_buf.data_mut().insert(
+                Tag::new(tag_bytes[0], tag_bytes[1]),
+                Value::String(BString::from(mi_value)),
+            );
+        }
 
         let current_flags = u16::from(rec_buf.flags());
         let new_flags = if is_dup {
