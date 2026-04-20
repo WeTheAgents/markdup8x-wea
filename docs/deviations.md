@@ -125,37 +125,38 @@ when reproducing a bug is required for byte-identical duplicate flags.**
   fragment-only false positives, inspect whether those positions
   harbor orphans in the input.
 
-### 8. `BARCODE_TAG` / `READ_ONE_BARCODE_TAG` / `READ_TWO_BARCODE_TAG` — semantically correct, not byte-identical on large datasets
+### 8. `BARCODE_TAG` / `READ_ONE_BARCODE_TAG` / `READ_TWO_BARCODE_TAG` — byte-identical dup flags; aux-tag ordering differs (see §10)
 
 - **Picard (3.4.0):** Pre-sorts all reads by `ReadEndsMDComparator` (keyed
   on unclipped 5'-most coord + strand + barcode hash) before dup detection.
   Stable-sort within tied keys preserves coord-sort order.
-- **Ours:** Streams the coordinate-sorted input record-by-record; single-end
-  group resolution is inline ("flush on key change"), which produces
-  Picard-identical output when all reads at a locus share the same key
-  (the default-off case, verified byte-identical on K562_REP1 and on the
-  truseq arm of GSE75823). With `BARCODE_TAG` enabled, reads at the same
-  `(ref, unclipped_5', strand)` locus can carry DIFFERENT UMIs and
-  interleave in the coord-sorted stream, causing our inline tracker to
-  split some groups that Picard's pre-sorted path keeps together.
-- **Why:** A coordinate-sorted streaming pass avoids Picard's
-  spill-to-disk sort and saves both memory and I/O. Matching Picard's
-  byte output under `BARCODE_TAG` requires either an upstream pre-sort
-  pass or a windowed multi-group buffer; both are architectural
-  changes scheduled for Track A.4+.
-- **Impact (measured on GSE75823 UMI arm, ~90M records):** ~2.8% of
-  records differ in the 0x400 flag — all are Picard-flagged duplicates
-  that wea leaves unflagged (i.e. wea under-flags; no false positives).
-  The hash primitives (`Objects.hash` / `String.hashCode`) are
-  bit-identical to Picard and are unit-tested. Paired-end duplicate
-  pairs with matching UMIs at matching coords ARE correctly flagged;
-  the divergence is localized to same-coord UMI-interleaving edge
-  cases, predominantly in single-end / orphan fragments.
-- **Detection:** when byte parity with Picard on UMI inputs is required,
-  pre-sort with `picard SortSam SORT_ORDER=coordinate` (which is
-  already a no-op for input) — the divergence persists because the
-  issue is on the dup-detection sort, not the input sort. The real
-  fix is Track A.4.
+- **Ours (post-A.4):** Streams the coordinate-sorted input record-by-record;
+  single-end group resolution uses a windowed multi-group buffer
+  (`SingleEndTracker` in `src/groups.rs` — `FxHashMap<SingleEndKey, _>`
+  with a `BTreeMap<(ref,close_at), _>` resolve index). Forward keys close
+  at `uc5 + FWD_WINDOW` (1024bp, ≥3× Illumina read length); reverse keys
+  close at `uc5`. This keeps UMI-interleaved same-boundary reads in the
+  same dup group across coord-sort interleaving.
+- **Measured on GSE75823 UMI arm (SRR2982529, 210,234,301 records):**
+  - `UNPAIRED_READ_DUPLICATES` = 115,216,153 on both wea and Picard
+    (exact match, 0 delta — before A.4 wea under-flagged by ~5.4M).
+  - `PERCENT_DUPLICATION` = 0.854001 on both (identical to 6 sig figs).
+  - Flag-only diff after `sort` on `(qname, dup_bit)`: **0 lines**
+    across all 210M records. Zero flag divergence vs Picard.
+  - First-11-SAM-field md5 after `sort`: `6fad908cd3f17392f8ab9e01138ff49d`
+    on both sides (byte-identical record content modulo aux tags).
+  - Full `samtools view | md5sum` still differs — that is the aux-tag
+    ordering issue tracked in §10, orthogonal to duplicate flagging.
+- **Why the change:** UMI-aware coord-sorted streaming MUST buffer
+  same-boundary reads across interleave; inline "flush on key change"
+  splits UMI-matched reads that Picard's pre-sorted path keeps in one
+  group. `FWD_WINDOW` is a static cap on forward left-clip (`pos - uc5`);
+  `SingleEndTracker::add_read` panics with a clear error if the cap is
+  exceeded (long-read input would need it raised).
+- **Residual risk:** long-read (PacBio/ONT) inputs trip the assertion
+  guard rather than silently miss dups — fail-fast behavior is
+  deliberate. The constant is a one-line change if that use case
+  arrives; see `src/groups.rs:FWD_WINDOW`.
 
 ### 9. `estimate_library_size` bail-out when unique ≥ total pairs
 
@@ -168,6 +169,31 @@ when reproducing a bug is required for byte-identical duplicate flags.**
   indistinguishable to MultiQC from Picard's zero-dup empty field.
 - **Impact:** Users running a pathological input see an empty field
   instead of an exception. No silent wrong answer.
+
+### 10. Auxiliary tag write order differs from Picard (cosmetic, no flag impact)
+
+- **Picard:** When copying a record through `MarkDuplicates`, it preserves
+  the input record's auxiliary tag order and inserts `PG:Z:MarkDuplicates`
+  in whatever position its SAM record builder chooses (typically after
+  `MD` and `NM`, before `RG`).
+- **Ours:** Auxiliary tags are re-emitted by the noodles writer in its
+  own canonical order; `PG:Z:MarkDuplicates` is appended at the end of
+  the tag list. All tag VALUES match Picard byte-for-byte; only the
+  order of tags within a single record's aux section differs.
+- **Why:** Tag value parity is what downstream consumers key on; BAM
+  readers (samtools, pysam, htslib, scanpy, etc.) parse aux tags by key,
+  not by positional offset, so consumers see identical fields regardless
+  of order. Matching Picard's exact tag-slot order would require
+  intercepting the noodles writer to preserve input-record tag order,
+  non-trivial for a zero-semantic-impact parity signal.
+- **Impact on GSE75823 UMI arm (210M records):** `samtools view | md5sum`
+  differs (`e49d036322b9a8a9f570c7a5550e114f` vs Picard
+  `077b9c81f1eb8aa83bab3982d1a72664`). `samtools view | cut -f1-11 | sort | md5sum`
+  is identical (`6fad908c…`). Flag-only diff is 0 lines in 210M records.
+- **If byte-identical BAM is required:** run through `samtools reheader`
+  + a tag-reordering script, or open a Track A.5+ ticket to customize
+  noodles' tag-writing order. Flag-based correctness (the point of
+  MarkDuplicates) is unaffected.
 
 ---
 
