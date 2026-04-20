@@ -182,70 +182,151 @@ impl Default for PairedGroupTracker {
     }
 }
 
-/// Inline single-end group tracker. Resolves consecutive groups immediately.
+/// Windowed single-end group tracker (A.4). Multi-group buffer keyed by
+/// `SingleEndKey`, resolved incrementally by a `resolve_at` BTreeMap mirroring
+/// [`PairedGroupTracker`].
 ///
-/// NOTE (A.2): This matches Picard's behavior byte-for-byte on the default-off
-/// (no `BARCODE_TAG`) path, where reads at the same (ref, uc5', strand) share
-/// a single key and arrive in consecutive runs in the coord-sorted stream.
-/// With `BARCODE_TAG` enabled, UMIs can bifurcate keys at the same coord and
-/// interleave, causing this inline tracker to split SE groups Picard would
-/// keep together. For paired-end UMI data (the common case) this is
-/// immaterial — SE groups only arise from orphans/unpaired fragments. This
-/// limitation is documented in `docs/deviations.md` as an A.2 known deviation
-/// and is addressed by the duplex-UMI work in Track A.4+.
+/// Motivation: the previous inline tracker (A.2-era) flushed on every key
+/// change, which split SE groups that Picard keeps together when UMIs
+/// interleave at the same unclipped_5' in a coord-sorted stream (three reads
+/// `(uc5=U,UMI=A), (uc5=U,UMI=B), (uc5=U,UMI=A)` → inline splits A+A into two
+/// singleton groups; Picard pre-sorts by `ReadEndsMDComparator` and keeps them
+/// together). This caused ~4.7% under-flag on the GSE75823 UMI arm.
+///
+/// Strand-specific close_at per key with `uc5=U`:
+/// - forward: `close_at = U + FWD_WINDOW`. Future forward reads with uc5=U
+///   arrive at pos ∈ [U, U + max_left_clip]. `FWD_WINDOW` is a conservative
+///   static bound on max_left_clip ≤ read_length.
+/// - reverse: `close_at = U`. Future reverse reads with uc5=U arrive at
+///   pos ≤ U (since uc5 = pos + aligned_span + right_clip ≥ pos), so once
+///   `current_pos > U` the group is complete.
+///
+/// Default-off byte-parity (`barcode_hash=0` everywhere): all reads sharing
+/// `(library, ref, uc5, strand)` share a `SingleEndKey` → land in one bucket
+/// regardless of insertion order. `resolve_group` output is deterministic in
+/// Vec contents (sort by score desc, record_id asc), so the windowed result
+/// equals the inline result on every default-off input where the inline
+/// tracker did not split groups it should have kept together — empirically
+/// true on the 8-sample / 934M-read ENCODE Phase-C gate.
 pub struct SingleEndTracker {
-    current_key: Option<SingleEndKey>,
-    current_group: Vec<ScoredSingle>,
+    groups: FxHashMap<SingleEndKey, Vec<ScoredSingle>>,
+    resolve_at: BTreeMap<(i32, i64), Vec<SingleEndKey>>,
+    max_left_clip_seen: i64,
     pub reads_examined: u64,
     pub read_duplicates: u64,
     pub group_sizes: Vec<u64>,
 }
 
+/// Forward-strand close_at window, in bp. Groups for a forward key with
+/// `uc5=U` are resolved once the stream advances past `U + FWD_WINDOW`.
+///
+/// Must be ≥ the maximum possible left soft/hard clip in the input BAM.
+/// For Illumina short reads (read length ≤ 300) this is trivially bounded by
+/// ~300; 1024 gives >3× margin. Long-read data (PacBio CCS ~25kb, ONT ~100kb)
+/// would need this raised — `SingleEndTracker::add_read` asserts a fail-fast
+/// panic when a forward read's `(pos - uc5)` exceeds this, so long-read
+/// corruption cannot go silent.
+const FWD_WINDOW: i64 = 1024;
+
 impl SingleEndTracker {
     pub fn new() -> Self {
         Self {
-            current_key: None,
-            current_group: Vec::new(),
+            groups: FxHashMap::default(),
+            resolve_at: BTreeMap::new(),
+            max_left_clip_seen: 0,
             reads_examined: 0,
             read_duplicates: 0,
             group_sizes: Vec::new(),
         }
     }
 
-    /// Add a single-end read. If key differs from current group, resolve the
-    /// current group first.
+    /// Add a single-end read to its group bucket.
+    ///
+    /// `record_pos` is the 0-based alignment start of the record (for forward
+    /// reads `pos - unclipped_5prime` equals the left_clip; for reverse reads
+    /// it is ≤ `unclipped_5prime` and not used by the window). Used to
+    /// register close_at and to assert the FWD_WINDOW invariant.
     ///
     /// `reads_examined` counts only real fragments (not paired markers), to
     /// match Picard's `UNPAIRED_READS_EXAMINED` semantics.
-    pub fn add_read(&mut self, key: SingleEndKey, scored: ScoredSingle, dup_bits: &mut dyn DupSet) {
+    pub fn add_read(&mut self, key: SingleEndKey, scored: ScoredSingle, record_pos: i64) {
         if !scored.is_paired_marker {
             self.reads_examined += 1;
         }
 
-        if self.current_key.as_ref() != Some(&key) {
-            self.resolve_current(dup_bits);
-            self.current_key = Some(key);
+        let close_at = if key.is_reverse {
+            key.unclipped_5prime
+        } else {
+            let clip = record_pos - key.unclipped_5prime;
+            debug_assert!(clip >= 0, "forward read: pos < unclipped_5prime");
+            assert!(
+                clip <= FWD_WINDOW,
+                "SE tracker: forward left_clip {} exceeds FWD_WINDOW {}; \
+                 likely long-read input — raise FWD_WINDOW or add CLI override",
+                clip,
+                FWD_WINDOW
+            );
+            if clip > self.max_left_clip_seen {
+                self.max_left_clip_seen = clip;
+            }
+            key.unclipped_5prime + FWD_WINDOW
+        };
+
+        self.resolve_at
+            .entry((key.ref_id, close_at))
+            .or_default()
+            .push(key.clone());
+        self.groups.entry(key).or_default().push(scored);
+    }
+
+    /// Resolve all groups whose close_at ≤ (ref_id, pos).
+    pub fn resolve_up_to(&mut self, ref_id: i32, pos: i64, dup_bits: &mut dyn DupSet) -> usize {
+        let cutoff = (ref_id, pos);
+        let keys_to_resolve: Vec<Vec<SingleEndKey>> = self
+            .resolve_at
+            .range(..=cutoff)
+            .map(|(_, keys)| keys.clone())
+            .collect();
+
+        let positions: Vec<(i32, i64)> =
+            self.resolve_at.range(..=cutoff).map(|(k, _)| *k).collect();
+        for p in &positions {
+            self.resolve_at.remove(p);
         }
-        self.current_group.push(scored);
+
+        let mut resolved = 0;
+        for keys in keys_to_resolve {
+            for key in keys {
+                if let Some(group) = self.groups.remove(&key) {
+                    self.resolve_group(group, dup_bits);
+                    resolved += 1;
+                }
+            }
+        }
+        resolved
     }
 
-    /// Flush the current group (call at chromosome boundary and EOF).
+    /// Flush all remaining groups (chromosome boundary and EOF).
     pub fn flush(&mut self, dup_bits: &mut dyn DupSet) {
-        self.resolve_current(dup_bits);
-        self.current_key = None;
+        let all_keys: Vec<SingleEndKey> = self.groups.keys().cloned().collect();
+        for key in all_keys {
+            if let Some(group) = self.groups.remove(&key) {
+                self.resolve_group(group, dup_bits);
+            }
+        }
+        self.resolve_at.clear();
     }
 
-    fn resolve_current(&mut self, dup_bits: &mut dyn DupSet) {
-        let size = self.current_group.len();
-        if size == 0 {
+    pub fn active_groups(&self) -> usize {
+        self.groups.len()
+    }
+
+    fn resolve_group(&mut self, mut group: Vec<ScoredSingle>, dup_bits: &mut dyn DupSet) {
+        if group.is_empty() {
             return;
         }
 
-        let fragment_count = self
-            .current_group
-            .iter()
-            .filter(|s| !s.is_paired_marker)
-            .count();
+        let fragment_count = group.iter().filter(|s| !s.is_paired_marker).count();
         if fragment_count >= self.group_sizes.len() {
             self.group_sizes.resize(fragment_count + 1, 0);
         }
@@ -253,33 +334,28 @@ impl SingleEndTracker {
             self.group_sizes[fragment_count] += 1;
         }
 
-        let has_paired_marker = self.current_group.iter().any(|s| s.is_paired_marker);
+        let has_paired_marker = group.iter().any(|s| s.is_paired_marker);
 
         if has_paired_marker {
-            for read in self.current_group.iter() {
+            for read in group.iter() {
                 if !read.is_paired_marker {
                     dup_bits.insert(read.record_id);
                     self.read_duplicates += 1;
                 }
             }
-            self.current_group.clear();
             return;
         }
 
         if fragment_count <= 1 {
-            self.current_group.clear();
             return;
         }
 
-        self.current_group
-            .sort_by(|a, b| b.score.cmp(&a.score).then(a.record_id.cmp(&b.record_id)));
+        group.sort_by(|a, b| b.score.cmp(&a.score).then(a.record_id.cmp(&b.record_id)));
 
-        for read in self.current_group.iter().skip(1) {
+        for read in group.iter().skip(1) {
             dup_bits.insert(read.record_id);
             self.read_duplicates += 1;
         }
-
-        self.current_group.clear();
     }
 }
 
@@ -477,7 +553,9 @@ mod tests {
     }
 
     #[test]
-    fn single_end_inline_resolution() {
+    fn single_end_windowed_resolution() {
+        // A.4: intermediate state during add_read is no longer observable
+        // (inline flush-on-key-change is gone). All assertions after flush.
         let mut tracker = SingleEndTracker::new();
         let mut dup_bits = BitVecDupSet::new();
 
@@ -496,7 +574,7 @@ mod tests {
                 record_id: 0,
                 is_paired_marker: false,
             },
-            &mut dup_bits,
+            1000,
         );
         tracker.add_read(
             key.clone(),
@@ -505,10 +583,9 @@ mod tests {
                 record_id: 1,
                 is_paired_marker: false,
             },
-            &mut dup_bits,
+            1000,
         );
 
-        // Different key triggers resolution of previous group
         let key2 = SingleEndKey {
             library_idx: 0,
             barcode_hash: 0,
@@ -523,14 +600,13 @@ mod tests {
                 record_id: 2,
                 is_paired_marker: false,
             },
-            &mut dup_bits,
+            2000,
         );
 
+        tracker.flush(&mut dup_bits);
         assert!(dup_bits.contains(1)); // Loser from first group
         assert!(!dup_bits.contains(0)); // Winner
         assert!(!dup_bits.contains(2)); // Only member of second group
-
-        tracker.flush(&mut dup_bits);
         assert_eq!(tracker.read_duplicates, 1);
     }
 
@@ -604,7 +680,7 @@ mod tests {
                 record_id: 7,
                 is_paired_marker: false,
             },
-            &mut dup_bits,
+            1000,
         );
         // Then a paired marker (zero score) — marker must still win
         tracker.add_read(
@@ -614,7 +690,7 @@ mod tests {
                 record_id: 42,
                 is_paired_marker: true,
             },
-            &mut dup_bits,
+            1000,
         );
         tracker.flush(&mut dup_bits);
 
@@ -649,11 +725,176 @@ mod tests {
                 record_id: 1,
                 is_paired_marker: true,
             },
-            &mut dup_bits,
+            1000,
         );
         tracker.flush(&mut dup_bits);
         assert_eq!(dup_bits.len(), 0);
         assert_eq!(tracker.reads_examined, 0);
+    }
+
+    // ---- Track A.4: windowed SingleEndTracker ----
+
+    fn se_key(uc5: i64, barcode_hash: i32, is_reverse: bool) -> SingleEndKey {
+        SingleEndKey {
+            library_idx: 0,
+            barcode_hash,
+            ref_id: 0,
+            unclipped_5prime: uc5,
+            is_reverse,
+        }
+    }
+
+    #[test]
+    fn single_end_umi_interleave_aba_grouped() {
+        // Target A.4 case: (uc5=100,UMI=A,id=0), (uc5=100,UMI=B,id=1),
+        // (uc5=100,UMI=A,id=2) arriving in that order. Inline would split
+        // A-records into two singleton groups; windowed keeps them together
+        // and flags id=2 as dup of id=0 (score 500 > 300).
+        let mut tracker = SingleEndTracker::new();
+        let mut dup_bits = BitVecDupSet::new();
+
+        tracker.add_read(
+            se_key(100, 0xAAAA, false),
+            ScoredSingle { score: 500, record_id: 0, is_paired_marker: false },
+            100,
+        );
+        tracker.add_read(
+            se_key(100, 0xBBBB, false),
+            ScoredSingle { score: 400, record_id: 1, is_paired_marker: false },
+            100,
+        );
+        tracker.add_read(
+            se_key(100, 0xAAAA, false),
+            ScoredSingle { score: 300, record_id: 2, is_paired_marker: false },
+            100,
+        );
+
+        tracker.flush(&mut dup_bits);
+        assert!(!dup_bits.contains(0), "UMI=A winner id=0 must survive");
+        assert!(!dup_bits.contains(1), "UMI=B singleton must not be flagged");
+        assert!(dup_bits.contains(2), "UMI=A id=2 must be flagged as dup");
+        assert_eq!(tracker.read_duplicates, 1);
+        assert_eq!(tracker.reads_examined, 3);
+    }
+
+    #[test]
+    fn single_end_resolve_up_to_triggers_close() {
+        let mut tracker = SingleEndTracker::new();
+        let mut dup_bits = BitVecDupSet::new();
+
+        tracker.add_read(
+            se_key(100, 0, false),
+            ScoredSingle { score: 500, record_id: 0, is_paired_marker: false },
+            100,
+        );
+        tracker.add_read(
+            se_key(100, 0, false),
+            ScoredSingle { score: 300, record_id: 1, is_paired_marker: false },
+            100,
+        );
+        // close_at = 100 + FWD_WINDOW; resolve well beyond that
+        let resolved = tracker.resolve_up_to(0, 100 + FWD_WINDOW + 1, &mut dup_bits);
+        assert_eq!(resolved, 1);
+        assert!(dup_bits.contains(1));
+        assert_eq!(tracker.active_groups(), 0);
+        assert_eq!(tracker.read_duplicates, 1);
+    }
+
+    #[test]
+    fn single_end_reverse_closes_earlier_than_forward() {
+        // Reverse close_at = uc5 exactly; forward = uc5 + FWD_WINDOW.
+        let mut tracker = SingleEndTracker::new();
+        let mut dup_bits = BitVecDupSet::new();
+
+        tracker.add_read(
+            se_key(100, 0, false),
+            ScoredSingle { score: 500, record_id: 0, is_paired_marker: false },
+            100,
+        );
+        tracker.add_read(
+            se_key(100, 0, true),
+            ScoredSingle { score: 500, record_id: 1, is_paired_marker: false },
+            50, // reverse read at pos 50, uc5 = 100 (span = 50)
+        );
+        // Advance stream to pos=101: reverse group close_at=100 ≤ 101 → closed.
+        // Forward group close_at=100+FWD_WINDOW ≫ 101 → still alive.
+        let resolved = tracker.resolve_up_to(0, 101, &mut dup_bits);
+        assert_eq!(resolved, 1, "only reverse group closes");
+        assert_eq!(tracker.active_groups(), 1);
+        // No dups: each group has one member.
+        assert_eq!(dup_bits.len(), 0);
+
+        tracker.flush(&mut dup_bits);
+        assert_eq!(dup_bits.len(), 0);
+    }
+
+    #[test]
+    fn single_end_paired_marker_after_interleave_flags_only_own_key() {
+        // Fragment with score=999 + foreign-UMI fragment + marker on same (uc5,strand)
+        // but matching UMI with the first fragment. Marker must flag the matching
+        // fragment regardless of its score; the foreign-UMI fragment stays
+        // untouched (different bucket).
+        let mut tracker = SingleEndTracker::new();
+        let mut dup_bits = BitVecDupSet::new();
+
+        tracker.add_read(
+            se_key(100, 0xAAAA, false),
+            ScoredSingle { score: 999, record_id: 0, is_paired_marker: false },
+            100,
+        );
+        tracker.add_read(
+            se_key(100, 0xBBBB, false),
+            ScoredSingle { score: 500, record_id: 1, is_paired_marker: false },
+            100,
+        );
+        tracker.add_read(
+            se_key(100, 0xAAAA, false),
+            ScoredSingle { score: 0, record_id: 99, is_paired_marker: true },
+            100,
+        );
+
+        tracker.flush(&mut dup_bits);
+        assert!(dup_bits.contains(0), "UMI=A fragment flagged by co-keyed marker");
+        assert!(!dup_bits.contains(1), "UMI=B fragment untouched");
+        assert!(!dup_bits.contains(99), "marker not a fragment");
+        assert_eq!(tracker.read_duplicates, 1);
+    }
+
+    #[test]
+    fn single_end_flush_clears_resolve_at_for_next_chromosome() {
+        let mut tracker = SingleEndTracker::new();
+        let mut dup_bits = BitVecDupSet::new();
+
+        tracker.add_read(
+            se_key(100, 0, false),
+            ScoredSingle { score: 500, record_id: 0, is_paired_marker: false },
+            100,
+        );
+        tracker.flush(&mut dup_bits);
+        assert_eq!(tracker.active_groups(), 0);
+
+        // Same (uc5, strand, barcode) but different ref — distinct key, fresh group.
+        tracker.add_read(
+            SingleEndKey { ref_id: 1, ..se_key(100, 0, false) },
+            ScoredSingle { score: 300, record_id: 1, is_paired_marker: false },
+            100,
+        );
+        tracker.flush(&mut dup_bits);
+        // Both groups had 1 member → no duplicates.
+        assert_eq!(dup_bits.len(), 0);
+        assert_eq!(tracker.read_duplicates, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds FWD_WINDOW")]
+    fn single_end_left_clip_over_window_panics() {
+        let mut tracker = SingleEndTracker::new();
+        // uc5=100, pos=100+FWD_WINDOW+1 → clip = FWD_WINDOW+1 → must panic.
+        tracker.add_read(
+            se_key(100, 0, false),
+            ScoredSingle { score: 0, record_id: 0, is_paired_marker: false },
+            100 + FWD_WINDOW + 1,
+        );
     }
 
     // ---- Track A.1: barcode_hash dimension in keys ----

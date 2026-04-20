@@ -318,8 +318,9 @@ pub fn scan_pass(
                     record_id: current_id,
                     is_paired_marker: false,
                 },
-                &mut dup_bits,
+                pos,
             );
+            single_tracker.resolve_up_to(tid_i32, pos, &mut dup_bits);
         } else {
             let qname_bytes: &[u8] = record
                 .name()
@@ -355,8 +356,9 @@ pub fn scan_pass(
                     record_id: current_id,
                     is_paired_marker: true,
                 },
-                &mut dup_bits,
+                pos,
             );
+            single_tracker.resolve_up_to(tid_i32, pos, &mut dup_bits);
 
             if let Some(mate) = pending.remove(nh, ch) {
                 let (ref_lo, pos_lo, rev_lo_raw, ref_hi, pos_hi, rev_hi_raw) =
