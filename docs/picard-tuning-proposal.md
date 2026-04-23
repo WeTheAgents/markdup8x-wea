@@ -262,6 +262,40 @@ without additional validation:
   `READ_NAME_REGEX=null`-style configs enable an extra hash table
   whose footprint is not captured here.
 
+## GSE75823 UMI library — memory envelope
+
+**Added 2026-04-23** in response to Jonathan's Slack ask: *"I'd entertain a modest reduction [of memory]… ideally add at least one UMI library to the test set"*.
+
+**Input:** `/mnt/HC_Volume_105344878/tmp/gse75823-prep/output/umi.sorted.bam` — 210,234,301 records, single-end, SCRB-seq (PCR-heavy), `BARCODE_TAG=RX`. Coordinate-sorted. Flag-md5 baseline against the checked-in `umi.picard340.bam`: `7d2c99de53b26d2f562cac134e92730f`.
+
+**Method:** identical driver shape to the ENCODE sweep in §Sweep matrix — `ASSUME_SORT_ORDER=coordinate`, `VALIDATION_STRINGENCY=LENIENT`, `CLEAR_DT=true`, `ADD_PG_TAG_TO_READS=true`, `TMP_DIR` under sweep workdir. `/usr/bin/time -v` for peak RSS + wall. Flag-md5 parity against baseline re-checked after every run. Serial — one JVM at a time (same host, 0 swap).
+
+| Config | Heap | Wall | Peak per-JVM RSS | Exit | Flag md5 = baseline |
+|--------|-----:|-----:|-----------------:|-----:|:-------------------:|
+| A | `-Xmx4g` | 22:07 | 2.23 GB | 0 | **YES** |
+| B | `-Xmx6g` | 21:41 | 3.23 GB | 0 | **YES** |
+| C | `-Xmx9g` | 21:39 | 5.12 GB | 0 | **YES** |
+| D | `-Xmx28g` (nf-core default) | 21:28 | 18.04 GB | 0 | **YES** |
+| — | `markdup-wea` | 8:41 | 147 MB | 0 | (separate flag-set baseline) |
+
+**Min non-OOM heap on this library: `-Xmx4g`** — with 1.8 GB of headroom against the ceiling. Picard's working set on 210 M SE UMI reads is ~2 GB; going higher just reserves memory the algorithm never touches. At `-Xmx28g` (the nf-core default) Picard sits on 18 GB it does not need.
+
+**Proposal §C target `-Xmx6g` — holds for UMI SE**, with ~3 GB of headroom. In fact `-Xmx4g` would hold too; we keep the `-Xmx6g` recommendation for PE/coverage-heavier libraries not represented here.
+
+**Wall time is flat (±30 s) across `-Xmx4g..28g`** — the algorithm is I/O-bound on this library, not heap-bound. Larger heaps bought nothing.
+
+**wea on the same input: 147 MB peak, 8 m 41 s wall** — ~125× less RAM and 2.5× faster than Picard at any heap. Not a parity check (flag-set differs by design documented in [deviations.md](deviations.md)); reported as a sibling tool envelope on the same box.
+
+Per-locus context for this library: deepest 5′-bucket is `15:69746012:F → 63,902` reads ([per-locus-pileup.md](per-locus-pileup.md)) — well under `MAX_RECORDS_IN_RAM=500000`. Per-locus depth is not the binding axis here. Matches what we'd expect: memory is dominated by sorting-collection overhead, not the hot locus.
+
+### Sweep artifacts
+
+On Hetzner:
+- `/mnt/HC_Volume_105344878/tmp/umi-memory-sweep/sweep.tsv` — summary table.
+- `/mnt/HC_Volume_105344878/tmp/umi-memory-sweep/picard-Xmx{4,6,9,28}g/{time.txt,picard.log,exit.txt,umi.mkdup.bam,umi.metrics}` — per-config inputs to the table.
+- `/mnt/HC_Volume_105344878/tmp/umi-memory-sweep/wea/{time.txt,wea.log,umi.bam,umi.metrics}`.
+- Driver: `/tmp/umi_mem_sweep.sh`.
+
 ## Reproducibility
 
 All per-config logs, per-sample `.time` files, `sweep.log`
